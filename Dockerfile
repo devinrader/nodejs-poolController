@@ -7,7 +7,6 @@ RUN echo "Current working directory is: $(pwd)"
 
 COPY package*.json ./
 COPY defaultConfig.json config.json
-COPY serial-test.js ./
 RUN npm ci
 
 RUN ls
