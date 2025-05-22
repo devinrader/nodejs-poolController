@@ -34,6 +34,10 @@ RUN mkdir /app && chown node:node /app
 RUN addgroup -g 46 usbaccess && \
     addgroup node usbaccess
 
+# Ensure dialout group exists, then add node to it
+RUN groupadd -r dialout || true && \
+    usermod -a -G dialout node
+    
 # Optional: Confirm user and group setup at build time
 RUN id node
 
