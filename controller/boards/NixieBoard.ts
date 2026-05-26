@@ -29,6 +29,15 @@ import { webApp } from "../../web/Server";
 import { setTimeout } from 'timers/promises';
 import { setTimeout as setTimeoutSync } from 'timers';
 
+const addrsPentairPump = Object.freeze([96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111]);
+const addrsRegalModbusPump = Object.freeze(
+    Array.from({ length: ((0xF7 - 0x15) / 2) + 1 }, (_, i) => 0x15 + i * 2)  // Odd numbers fro 0x15 through 0xF7
+  );
+const addrsNeptuneModbusPump = Object.freeze(
+    Array.from({ length: 247 }, (_, i) => i + 1) // Modbus slave IDs 1..247
+);
+
+
 export class NixieBoard extends SystemBoard {
     constructor (system: PoolSystem){
         super(system);
@@ -76,14 +85,16 @@ export class NixieBoard extends SystemBoard {
             [17, { name: 'watercolors', desc: 'WaterColors', isLight: true, theme: 'watercolors' }],
         ]);
         this.valueMaps.pumpTypes = new byteValueMap([
-            [1, { name: 'ss', desc: 'Single Speed', maxCircuits: 8, hasAddress: false, hasBody: false, maxRelays: 1, relays: [{ id: 1, name: 'Pump On/Off' }]}],
-            [2, { name: 'ds', desc: 'Two Speed', maxCircuits: 8, hasAddress: false, hasBody: false, maxRelays: 2, relays: [{ id: 1, name: 'Low Speed' }, { id: 2, name: 'High Speed' }]}],
-            [3, { name: 'vs', desc: 'Intelliflo VS', maxPrimingTime: 6, minSpeed: 450, maxSpeed: 3450, maxCircuits: 8, hasAddress: true }],
-            [4, { name: 'vsf', desc: 'Intelliflo VSF', minSpeed: 450, maxSpeed: 3450, minFlow: 15, maxFlow: 130, maxCircuits: 8, hasAddress: true }],
-            [5, { name: 'vf', desc: 'Intelliflo VF', minFlow: 15, maxFlow: 130, maxCircuits: 8, hasAddress: true }],
-            [6, { name: 'hwvs', desc: 'Hayward Eco/TriStar VS', minSpeed: 450, maxSpeed: 3450, maxCircuits: 8, hasAddress: true }],
-            [7, { name: 'hwrly', desc: 'Hayward Relay VS', hasAddress: false, maxCircuits: 8, maxRelays: 4, maxSpeeds: 8, relays: [{ id: 1, name: 'Step #1' }, { id: 2, name: 'Step #2'}, { id: 3, name: 'Step #3' }, { id: 4, name: 'Pump On' }] }],
-            [100, { name: 'sf', desc: 'SuperFlo VS', hasAddress: false, maxCircuits: 8, maxRelays: 4, equipmentMaster: 1, maxSpeeds: 4, relays: [{ id: 1, name: 'Program #1' }, { id: 2, name: 'Program #2' }, { id: 3, name: 'Program #3' }, { id: 4, name: 'Program #4' }]}]
+            [1, { name: 'ss', desc: 'Single Speed', maxCircuits: 8, hasAddress: false, hasBody: false, maxRelays: 1, relays: [{ id: 1, name: 'Pump On/Off' }], addresses: []}],
+            [2, { name: 'ds', desc: 'Two Speed', maxCircuits: 8, hasAddress: false, hasBody: false, maxRelays: 2, relays: [{ id: 1, name: 'Low Speed' }, { id: 2, name: 'High Speed' }], addresses: []}],
+            [3, { name: 'vs', desc: 'Intelliflo VS', maxPrimingTime: 6, minSpeed: 450, maxSpeed: 3450, maxCircuits: 8, hasAddress: true, addresses: addrsPentairPump }],
+            [4, { name: 'vsf', desc: 'Intelliflo VSF', minSpeed: 450, maxSpeed: 3450, minFlow: 15, maxFlow: 130, maxCircuits: 8, hasAddress: true, addresses: addrsPentairPump }],
+            [5, { name: 'vf', desc: 'Intelliflo VF', minFlow: 15, maxFlow: 130, maxCircuits: 8, hasAddress: true, addresses: addrsPentairPump }],
+            [6, { name: 'hwvs', desc: 'Hayward Eco/TriStar VS', minSpeed: 450, maxSpeed: 3450, maxCircuits: 8, hasAddress: true, addresses: addrsPentairPump }],
+            [7, { name: 'hwrly', desc: 'Hayward Relay VS', hasAddress: false, maxCircuits: 8, maxRelays: 4, maxSpeeds: 8, relays: [{ id: 1, name: 'Step #1' }, { id: 2, name: 'Step #2'}, { id: 3, name: 'Step #3' }, { id: 4, name: 'Pump On' }], addresses: [] }],
+            [100, { name: 'sf', desc: 'SuperFlo VS', hasAddress: false, maxCircuits: 8, maxRelays: 4, equipmentMaster: 1, maxSpeeds: 4, relays: [{ id: 1, name: 'Program #1' }, { id: 2, name: 'Program #2' }, { id: 3, name: 'Program #3' }, { id: 4, name: 'Program #4' }], addresses: [] }],
+            [200, { name: 'regalmodbus', desc: 'Regal Modbus', minSpeed: 450, maxSpeed: 3450, maxCircuits: 8, hasAddress: true, addresses: addrsRegalModbusPump}],
+            [201, { name: 'neptunemodbus', desc: 'Neptune Modbus', minSpeed: 450, maxSpeed: 3450, maxCircuits: 8, hasAddress: true, addresses: addrsNeptuneModbusPump }],
         ]);
         // RSG - same as systemBoard definition; can delete.
         this.valueMaps.heatModes = new byteValueMap([
@@ -101,12 +112,20 @@ export class NixieBoard extends SystemBoard {
             [6, { name: 'sat', desc: 'Saturday', dow: 6, bitval: 32 }],
             [7, { name: 'sun', desc: 'Sunday', dow: 0, bitval: 64 }]
         ]);
+        /**
+         * groupCircuitStates value map:
+         * 1: 'on'         - Circuit should be ON when group is ON, OFF when group is OFF.
+         * 2: 'off'        - Circuit should be OFF when group is ON, ON when group is OFF.
+         * 3: 'ignore'     - Circuit is ignored by group state changes.
+         * 4: 'on+ignore'  - Circuit should be ON when group is ON, ignored when group is OFF.
+         * 5: 'off+ignore' - Circuit should be OFF when group is ON, ignored when group is OFF.
+         */
         this.valueMaps.groupCircuitStates = new byteValueMap([
-            [1, { name: 'on', desc: 'On/Off' }],
-            [2, { name: 'off', desc: 'Off/On' }],
-            [3, { name: 'ignore', desc: 'Ignore' }],
-            [4, { name: 'on+ignore', desc: 'On/Ignore' }],
-            [5, { name: 'off+ignore', desc: 'Off/Ignore' }]
+            [1, { name: 'on', desc: 'On/Off' }],         // 1: ON when group ON, OFF when group OFF
+            [2, { name: 'off', desc: 'Off/On' }],        // 2: OFF when group ON, ON when group OFF
+            [3, { name: 'ignore', desc: 'Ignore' }],     // 3: Ignored by group state
+            [4, { name: 'on+ignore', desc: 'On/Ignore' }],   // 4: ON when group ON, ignored when group OFF
+            [5, { name: 'off+ignore', desc: 'Off/Ignore' }]  // 5: OFF when group ON, ignored when group OFF
         ]);
         this.valueMaps.chlorinatorModel = new byteValueMap([
             [0, { name: 'unknown', desc: 'unknown', capacity: 0, chlorinePerDay: 0, chlorinePerSec: 0 }],
@@ -234,7 +253,7 @@ export class NixieBoard extends SystemBoard {
             [64, { name: 'violet', desc: 'Violet', types: ['watercolors'], sequence: 9 }],
             [65, { name: 'slowcolorsplash', desc: 'Slow Color Splash', types: ['watercolors'], sequence: 10 }],
             [66, { name: 'fastcolorsplash', desc: 'Fast Color Splash', types: ['watercolors'], sequence: 11 }],
-            [67, { name: 'americathebeautiful', desc: 'America the Beautiful', types: ['watercolors'], sequence: 12 }],
+            [67, { name: 'americathebeautiful', desc: 'America Beautiful', types: ['watercolors'], sequence: 12 }],
             [68, { name: 'fattuesday', desc: 'Fat Tuesday', types: ['watercolors'], sequence: 13 }],
             [69, { name: 'discotech', desc: 'Disco Tech', types: ['watercolors'], sequence: 14 }],
             [255, { name: 'none', desc: 'None' }]
@@ -1096,9 +1115,7 @@ export class NixieCircuitCommands extends CircuitCommands {
         return arr;
     }
     public getCircuitFunctions() {
-        let cf = sys.board.valueMaps.circuitFunctions.toArray();
-        if (!sys.equipment.shared) cf = cf.filter(x => { return x.name !== 'spillway' && x.name !== 'spadrain' });
-        return cf;
+        return super.getCircuitFunctions();
     }
     public getCircuitNames() {
         return [...sys.board.valueMaps.circuitNames.toArray(), ...sys.board.valueMaps.customNames.toArray()];
@@ -1118,6 +1135,7 @@ export class NixieCircuitCommands extends CircuitCommands {
             if (data.name) circuit.name = scircuit.name = data.name;
             else if (!circuit.name && !data.name) circuit.name = scircuit.name = Circuit.getIdName(id);
             if (typeof data.type !== 'undefined' || typeof circuit.type === 'undefined') circuit.type = scircuit.type = parseInt(data.type, 10) || 0;
+            this.assertSinglePoolSpaType(id, circuit.type);
             if (typeof data.freeze !== 'undefined' || typeof circuit.freeze === 'undefined') circuit.freeze = utils.makeBool(data.freeze) || false;
             if (typeof data.showInFeatures !== 'undefined' || typeof data.showInFeatures === 'undefined') circuit.showInFeatures = scircuit.showInFeatures = utils.makeBool(data.showInFeatures);
             if (typeof data.dontStop !== 'undefined' && utils.makeBool(data.dontStop) === true) data.eggTimer = 1440;
@@ -1231,7 +1249,7 @@ export class NixieCircuitCommands extends CircuitCommands {
     }
     public async deleteCircuitGroupAsync(obj: any): Promise<CircuitGroup> {
         let id = parseInt(obj.id, 10);
-        if (isNaN(id)) return Promise.reject(new EquipmentNotFoundError(`Invalid group id: ${obj.id}`, 'CircuitGroup'));
+        if (isNaN(id)) return Promise.reject(new InvalidEquipmentIdError(`Invalid group id: ${obj.id}`, obj.id, 'CircuitGroup'));
         if (!sys.board.equipmentIds.circuitGroups.isInRange(id)) return;
         if (typeof obj.id !== 'undefined') {
             let group = sys.circuitGroups.getItemById(id, false);
@@ -1249,7 +1267,7 @@ export class NixieCircuitCommands extends CircuitCommands {
     }
     public async deleteLightGroupAsync(obj: any): Promise<LightGroup> {
         let id = parseInt(obj.id, 10);
-        if (isNaN(id)) return Promise.reject(new EquipmentNotFoundError(`Invalid group id: ${obj.id}`, 'LightGroup'));
+        if (isNaN(id)) return Promise.reject(new InvalidEquipmentIdError(`Invalid group id: ${obj.id}`, obj.id, 'LightGroup'));
         if (!sys.board.equipmentIds.circuitGroups.isInRange(id)) return;
         if (typeof obj.id !== 'undefined') {
             let group = sys.lightGroups.getItemById(id, false);
@@ -1762,7 +1780,7 @@ export class NixieValveCommands extends ValveCommands {
             state.valves.removeItemById(id);
             ncp.valves.removeById(id);
             return valve;
-        } catch (err) { logger.error(`Nixie: Error removing valve from system ${obj.id}: ${err.message}`); return Promise.reject(new Error(`Nixie: Error removing valve from system ${ obj.id }: ${ err.message }`)); }
+        } catch (err) { return Promise.reject(new BoardProcessError(err.message, 'deleteValveAsync')); }
     }
     public async setValveStateAsync(valve: Valve, vstate: ValveState, isDiverted: boolean) {
         try {
@@ -1821,6 +1839,7 @@ export class NixieHeaterCommands extends HeaterCommands {
         let gasHeaterInstalled = htypes.gas > 0;
         let ultratempInstalled = htypes.ultratemp > 0;
         let mastertempInstalled = htypes.mastertemp > 0;
+        let jxiInstalled = (htypes.jxi || 0) > 0 || (htypes.lxi || 0) > 0;
         let hybridInstalled = htypes.hybrid > 0;
         // The heat mode options are
         // 1 = Off
@@ -1872,7 +1891,7 @@ export class NixieHeaterCommands extends HeaterCommands {
             //    [21, { name: 'dual', desc: 'Dual Heat' }]
             //]);
         }
-        if (gasHeaterInstalled) sys.board.valueMaps.heatSources.merge([[2, { name: 'heater', desc: 'Heater' }]]);
+        if (gasHeaterInstalled || jxiInstalled) sys.board.valueMaps.heatSources.merge([[2, { name: 'heater', desc: 'Heater' }]]);
         if (mastertempInstalled) sys.board.valueMaps.heatSources.merge([[11, { name: 'mtheater', desc: 'MasterTemp' }]]);
         if (solarInstalled && (gasHeaterInstalled || heatPumpInstalled)) sys.board.valueMaps.heatSources.merge([[3, { name: 'solar', desc: 'Solar Only', hasCoolSetpoint: htypes.hasCoolSetpoint }], [4, { name: 'solarpref', desc: 'Solar Preferred', hasCoolSetpoint: htypes.hasCoolSetpoint }]]);
         else if (solarInstalled) sys.board.valueMaps.heatSources.merge([[3, { name: 'solar', desc: 'Solar', hasCoolSetpoint: htypes.hasCoolSetpoint }]]);
@@ -1883,7 +1902,7 @@ export class NixieHeaterCommands extends HeaterCommands {
         sys.board.valueMaps.heatSources.merge([[0, { name: 'nochange', desc: 'No Change' }]]);
 
 
-        if (gasHeaterInstalled) sys.board.valueMaps.heatModes.merge([[2, { name: 'heater', desc: 'Heater' }]]);
+        if (gasHeaterInstalled || jxiInstalled) sys.board.valueMaps.heatModes.merge([[2, { name: 'heater', desc: 'Heater' }]]);
         if (mastertempInstalled) sys.board.valueMaps.heatModes.merge([[11, { name: 'mtheater', desc: 'MasterTemp' }]]);
         if (solarInstalled && (gasHeaterInstalled || heatPumpInstalled || mastertempInstalled)) sys.board.valueMaps.heatModes.merge([[3, { name: 'solar', desc: 'Solar Only' }], [4, { name: 'solarpref', desc: 'Solar Preferred' }]]);
         else if (solarInstalled) sys.board.valueMaps.heatModes.merge([[3, { name: 'solar', desc: 'Solar' }]]);

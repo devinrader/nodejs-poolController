@@ -764,7 +764,7 @@ export class TouchScheduleCommands extends ScheduleCommands {
 
 
             // If we have sunrise/sunset then adjust for the values; if heliotrope isn't set just ignore
-            if (state.heliotrope.isCalculated) {
+            if (state.heliotrope.isCalculated && state.heliotrope.sunrise && state.heliotrope.sunset) {
                 const sunrise = state.heliotrope.sunrise.getHours() * 60 + state.heliotrope.sunrise.getMinutes();
                 const sunset = state.heliotrope.sunset.getHours() * 60 + state.heliotrope.sunset.getMinutes();
                 if (startTimeType === sys.board.valueMaps.scheduleTimeTypes.getValue('sunrise')) startTime = (sunrise + startTimeOffset);
@@ -963,7 +963,7 @@ export class TouchScheduleCommands extends ScheduleCommands {
         // This will check the schedule and if the existing sunrise/sunset times 
         // are not matching the desired time it will update the time on the OCP.
         // https://github.com/tagyoureit/nodejs-poolController/discussions/560#discussioncomment-3362149
-        if (!state.heliotrope.isCalculated) { return false; }
+        if (!state.heliotrope.isCalculated || !state.heliotrope.sunrise || !state.heliotrope.sunset) { return false; }
         const sunrise = state.heliotrope.sunrise.getHours() * 60 + state.heliotrope.sunrise.getMinutes();
         const sunset = state.heliotrope.sunset.getHours() * 60 + state.heliotrope.sunset.getMinutes();
 
@@ -1218,6 +1218,26 @@ class TouchSystemCommands extends SystemCommands {
     }
 }
 class TouchBodyCommands extends BodyCommands {
+    public getHeatSources(bodyId: number) {
+        let heatSources = super.getHeatSources(bodyId);
+        for (let i = 0; i < heatSources.length; i++) {
+            let hm = heatSources[i];
+            if (hm?.name === 'ultratemp' && typeof hm.val === 'undefined') {
+                heatSources[i] = this.board.valueMaps.heatSources.transformByName('heatpump');
+            }
+        }
+        return heatSources;
+    }
+    public getHeatModes(bodyId: number) {
+        let heatModes = super.getHeatModes(bodyId);
+        for (let i = 0; i < heatModes.length; i++) {
+            let hm = heatModes[i];
+            if (hm?.name === 'ultratemp' && typeof hm.val === 'undefined') {
+                heatModes[i] = this.board.valueMaps.heatModes.transformByName('heatpump');
+            }
+        }
+        return heatModes;
+    }
     public async setBodyAsync(obj: any): Promise<Body> {
         // The 168 is a funky packet in *Touch because it can set:
         // * Intellichem Installed (byte 3, bit 1)
@@ -1499,6 +1519,7 @@ export class TouchCircuitCommands extends CircuitCommands {
             let cstate = state.circuits.getInterfaceById(data.id, true);
             let showInFeatures = cstate.showInFeatures = typeof data.showInFeatures !== 'undefined' ? utils.makeBool(data.showInFeatures) : circuit.showInFeatures;
             let typeByte = parseInt(data.type, 10) === 0 ? 0 : parseInt(data.type, 10) || circuit.type || sys.board.valueMaps.circuitFunctions.getValue('generic');
+            this.assertSinglePoolSpaType(id, typeByte);
             let freeze = typeof data.freeze !== 'undefined' ? utils.makeBool(data.freeze) : circuit.freeze;
             let nameByte = 3; // set default `Aux 1`
             if (typeof data.nameId !== 'undefined') nameByte = data.nameId;
@@ -2701,6 +2722,18 @@ class TouchHeaterCommands extends HeaterCommands {
         let heaters = sys.heaters.get();
         let types = sys.board.valueMaps.heaterTypes.toArray();
         let inst = { total: 0 };
+        // If NCP directly controls an ultratemp/heatpump for the same body, suppress
+        // corresponding OCP ghost entries for that body only.
+        let hasNcpUltratempForBody = (ocpHeater: Heater): boolean => {
+            let ocpBody = typeof ocpHeater.body === 'number' ? ocpHeater.body : 32;
+            return heaters.some(h => {
+                if (h.master !== 1 || h.isActive === false) return false;
+                let t = types.find(elem => elem.val === h.type);
+                if (!t || (t.name !== 'ultratemp' && t.name !== 'heatpump')) return false;
+                let ncpBody = typeof h.body === 'number' ? h.body : 32;
+                return ncpBody === 32 || ocpBody === 32 || ncpBody === ocpBody;
+            });
+        };
         for (let i = 0; i < types.length; i++) if (types[i].name !== 'none') inst[types[i].name] = 0;
         for (let i = 0; i < heaters.length; i++) {
             let heater = heaters[i];
@@ -2709,6 +2742,9 @@ class TouchHeaterCommands extends HeaterCommands {
             }
             let type = types.find(elem => elem.val === heater.type);
             if (typeof type !== 'undefined') {
+                // Skip OCP ghost heaters only when there is a matching NCP-controlled
+                // ultratemp/heatpump for this heater's body.
+                if (heater.master === 0 && (type.name === 'hybrid' || type.name === 'ultratemp' || type.name === 'solar') && hasNcpUltratempForBody(heater)) continue;
                 if (inst[type.name] === 'undefined') inst[type.name] = 0;
                 inst[type.name] = inst[type.name] + 1;
                 if (heater.coolingEnabled === true && type.hasCoolSetpoint === true) inst['hasCoolSetpoint'] = true;
@@ -2971,6 +3007,10 @@ class TouchHeaterCommands extends HeaterCommands {
                     [21, { name: 'ultratemp', desc: 'Ultratemp Only', hasCoolSetpoint: htypes.hasCoolSetpoint }]
                 ])
             }
+            else if (ultratempInstalled) {
+                sys.board.valueMaps.heatModes.set(1, { name: 'heatpump', desc: 'Heat Pump' });
+                sys.board.valueMaps.heatSources.set(2, { name: 'heatpump', desc: 'Heat Pump', hasCoolSetpoint: htypes.hasCoolSetpoint });
+            }
             else {
                 // only gas
                 sys.board.valueMaps.heatModes.delete(2);
@@ -3022,6 +3062,9 @@ class TouchChemControllerCommands extends ChemControllerCommands {
             let cyanuricAcid = typeof data.cyanuricAcid !== 'undefined' ? parseInt(data.cyanuricAcid, 10) : chem.cyanuricAcid;
             let alkalinity = typeof data.alkalinity !== 'undefined' ? parseInt(data.alkalinity, 10) : chem.alkalinity;
             let borates = typeof data.borates !== 'undefined' ? parseInt(data.borates, 10) : chem.borates || 0;
+            let intellichemStandalone = sys.controllerType === ControllerType.Nixie
+                ? (typeof data.intellichemStandalone !== 'undefined' ? utils.makeBool(data.intellichemStandalone) : chem.intellichemStandalone)
+                : false;
             let body = sys.board.bodies.mapBodyAssociation(typeof data.body === 'undefined' ? chem.body : data.body);
             if (typeof body === 'undefined') return Promise.reject(new InvalidEquipmentDataError(`Invalid body assignment`, 'chemController', data.body || chem.body));
             // Do a final validation pass so we dont send this off in a mess.
@@ -3030,8 +3073,8 @@ class TouchChemControllerCommands extends ChemControllerCommands {
             if (isNaN(alkalinity)) return Promise.reject(new InvalidEquipmentDataError(`Invalid alkalinity`, 'chemController', alkalinity));
             if (isNaN(borates)) return Promise.reject(new InvalidEquipmentDataError(`Invalid borates`, 'chemController', borates));
             let schem = state.chemControllers.getItemById(chem.id, true);
-            let pHSetpoint = typeof data.ph !== 'undefined' && typeof data.ph.setpoint !== 'undefined' ? parseFloat(data.ph.setpoint) : chem.ph.setpoint;
-            let orpSetpoint = typeof data.orp !== 'undefined' && typeof data.orp.setpoint !== 'undefined' ? parseInt(data.orp.setpoint, 10) : chem.orp.setpoint;
+            let pHSetpoint = (typeof data.ph !== 'undefined' && typeof data.ph.setpoint !== 'undefined') ? parseFloat(data.ph.setpoint) : chem.ph.setpoint;
+            let orpSetpoint = (typeof data.orp !== 'undefined' && typeof data.orp.setpoint !== 'undefined') ? parseInt(data.orp.setpoint, 10) : chem.orp.setpoint;
             let lsiRange = typeof data.lsiRange !== 'undefined' ? data.lsiRange : chem.lsiRange || {};
             if (typeof data.lsiRange !== 'undefined') {
                 if (typeof data.lsiRange.enabled !== 'undefined') lsiRange.enabled = utils.makeBool(data.lsiRange.enabled);
@@ -3040,31 +3083,31 @@ class TouchChemControllerCommands extends ChemControllerCommands {
             }
             if (isNaN(pHSetpoint) || pHSetpoint > type.ph.max || pHSetpoint < type.ph.min) return Promise.reject(new InvalidEquipmentDataError(`Invalid pH setpoint`, 'ph.setpoint', pHSetpoint));
             if (isNaN(orpSetpoint) || orpSetpoint > type.orp.max || orpSetpoint < type.orp.min) return Promise.reject(new InvalidEquipmentDataError(`Invalid orp setpoint`, 'orp.setpoint', orpSetpoint));
-            let phTolerance = typeof data.ph.tolerance !== 'undefined' ? data.ph.tolerance : chem.ph.tolerance;
-            let orpTolerance = typeof data.orp.tolerance !== 'undefined' ? data.orp.tolerance : chem.orp.tolerance;
-            if (typeof data.ph.tolerance !== 'undefined') {
+            let phTolerance = (typeof data.ph !== 'undefined' && typeof data.ph.tolerance !== 'undefined') ? data.ph.tolerance : chem.ph.tolerance;
+            let orpTolerance = (typeof data.orp !== 'undefined' && typeof data.orp.tolerance !== 'undefined') ? data.orp.tolerance : chem.orp.tolerance;
+            if (typeof data.ph !== 'undefined' && typeof data.ph.tolerance !== 'undefined') {
                 if (typeof data.ph.tolerance.enabled !== 'undefined') phTolerance.enabled = utils.makeBool(data.ph.tolerance.enabled);
                 if (typeof data.ph.tolerance.low !== 'undefined') phTolerance.low = parseFloat(data.ph.tolerance.low);
                 if (typeof data.ph.tolerance.high !== 'undefined') phTolerance.high = parseFloat(data.ph.tolerance.high);
                 if (isNaN(phTolerance.low)) phTolerance.low = type.ph.min;
                 if (isNaN(phTolerance.high)) phTolerance.high = type.ph.max;
             }
-            if (typeof data.orp.tolerance !== 'undefined') {
+            if (typeof data.orp !== 'undefined' && typeof data.orp.tolerance !== 'undefined') {
                 if (typeof data.orp.tolerance.enabled !== 'undefined') orpTolerance.enabled = utils.makeBool(data.orp.tolerance.enabled);
                 if (typeof data.orp.tolerance.low !== 'undefined') orpTolerance.low = parseFloat(data.orp.tolerance.low);
                 if (typeof data.orp.tolerance.high !== 'undefined') orpTolerance.high = parseFloat(data.orp.tolerance.high);
                 if (isNaN(orpTolerance.low)) orpTolerance.low = type.orp.min;
                 if (isNaN(orpTolerance.high)) orpTolerance.high = type.orp.max;
             }
-            let phEnabled = typeof data.ph.enabled !== 'undefined' ? utils.makeBool(data.ph.enabled) : chem.ph.enabled;
-            let orpEnabled = typeof data.orp.enabled !== 'undefined' ? utils.makeBool(data.orp.enabled) : chem.orp.enabled;
+            let phEnabled = (typeof data.ph !== 'undefined' && typeof data.ph.enabled !== 'undefined') ? utils.makeBool(data.ph.enabled) : chem.ph.enabled;
+            let orpEnabled = (typeof data.orp !== 'undefined' && typeof data.orp.enabled !== 'undefined') ? utils.makeBool(data.orp.enabled) : chem.orp.enabled;
             let siCalcType = typeof data.siCalcType !== 'undefined' ? sys.board.valueMaps.siCalcTypes.encode(data.siCalcType, 0) : chem.siCalcType;
 
             let saltLevel = (state.chlorinators.length > 0) ? state.chlorinators.getItemById(1).saltLevel || 1000 : 1000
             chem.ph.tank.capacity = 6;
             chem.orp.tank.capacity = 6;
-            let acidTankLevel = typeof data.ph !== 'undefined' && typeof data.ph.tank !== 'undefined' && typeof data.ph.tank.level !== 'undefined' ? parseInt(data.ph.tank.level, 10) : schem.ph.tank.level;
-            let orpTankLevel = typeof data.orp !== 'undefined' && typeof data.orp.tank !== 'undefined' && typeof data.orp.tank.level !== 'undefined' ? parseInt(data.orp.tank.level, 10) : schem.orp.tank.level;
+            let acidTankLevel = (typeof data.ph !== 'undefined' && typeof data.ph.tank !== 'undefined' && typeof data.ph.tank.level !== 'undefined') ? parseInt(data.ph.tank.level, 10) : schem.ph.tank.level;
+            let orpTankLevel = (typeof data.orp !== 'undefined' && typeof data.orp.tank !== 'undefined' && typeof data.orp.tank.level !== 'undefined') ? parseInt(data.orp.tank.level, 10) : schem.orp.tank.level;
             // OCP needs to set the IntelliChem as active so it knows that it exists
             if (sl.enabled && send) {
                 if (!schem.isActive) {
@@ -3107,6 +3150,7 @@ class TouchChemControllerCommands extends ChemControllerCommands {
             chem.alkalinity = alkalinity;
             chem.borates = borates;
             chem.body = schem.body = body.val;
+            chem.intellichemStandalone = intellichemStandalone;
             schem.isActive = chem.isActive = true;
             chem.lsiRange.enabled = lsiRange.enabled;
             chem.lsiRange.low = lsiRange.low;

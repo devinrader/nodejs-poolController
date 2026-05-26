@@ -1,4 +1,4 @@
-﻿import { EquipmentNotFoundError, InvalidEquipmentDataError, InvalidEquipmentIdError, ParameterOutOfRangeError } from '../../Errors';
+import { EquipmentNotFoundError, InvalidEquipmentDataError, InvalidEquipmentIdError, ParameterOutOfRangeError } from '../../Errors';
 import { utils, Timestamp } from '../../Constants';
 import { logger } from '../../../logger/Logger';
 
@@ -11,6 +11,7 @@ import { webApp, InterfaceServerResponse } from "../../../web/Server";
 import { Outbound, Protocol, Response } from '../../comms/messages/Messages';
 import { conn } from '../../comms/Comms';
 import { setTimeout } from 'timers/promises';
+import { NeptuneModbusStateMessage } from '../../comms/messages/status/NeptuneModbusStateMessage';
 
 export class NixiePumpCollection extends NixieEquipmentCollection<NixiePump> {
     public async deletePumpAsync(id: number) {
@@ -137,6 +138,10 @@ export class NixiePumpCollection extends NixieEquipmentCollection<NixiePump> {
                 return new NixiePumpHWVS(this.controlPanel, pump);
             case 'hwrly':
                 return new NixiePumpHWRLY(this.controlPanel, pump);
+            case 'regalmodbus':
+                return new NixiePumpRegalModbus(this.controlPanel, pump);
+            case 'neptunemodbus':
+                return new NixiePumpNeptuneModbus(this.controlPanel, pump);
             default:
                 throw new EquipmentNotFoundError(`NCP: Cannot create pump ${pump.name}.`, type);
         }
@@ -235,6 +240,8 @@ export class NixiePump extends NixieEquipment {
                         case 'hwvs':
                         case 'vssvrs':
                         case 'vs':
+                        case 'regalmodbus':
+                        case 'neptunemodbus':
                             c.units = sys.board.valueMaps.pumpUnits.getValue('rpm');
                             break;
                         case 'ss':
@@ -282,7 +289,9 @@ export class NixiePump extends NixieEquipment {
             // for the 112 address prevented that previously, but now is just a final fail safe.
             if (typeof this._pollTimer !== 'undefined' || this._pollTimer) clearTimeout(this._pollTimer);
             this._pollTimer = null;
-            if (this.suspendPolling || this.closing || this.pump.address > 112) {
+            const pumpTypeName = sys.board.valueMaps.pumpTypes.getName(this.pump.type);
+            const supportsHighAddress = pumpTypeName === 'regalmodbus' || pumpTypeName === 'neptunemodbus';
+            if (this.suspendPolling || this.closing || (!supportsHighAddress && this.pump.address > 112)) {
                 if (this.suspendPolling) logger.info(`Pump ${this.id} Polling Suspended`);
                 if (this.closing) logger.info(`Pump ${this.id} is closing`);
                 return;
@@ -949,7 +958,7 @@ export class NixiePumpHWVS extends NixiePumpRS485 {
                     }
                 }
             }
-        } catch(err) { `Error sending setPumpToRemoteControl message for ${this.pump.name}: ${err.message}` };
+        } catch(err) { logger.error(`Error sending setPumpToRemoteControl message for ${this.pump.name}: ${err.message}`); };
     }
     protected async setPumpRPMAsync() {
         // Address 1
@@ -993,4 +1002,338 @@ export class NixiePumpHWVS extends NixiePumpRS485 {
         }
 
     };
+}
+
+export class NixiePumpRegalModbus extends NixiePump {
+
+    constructor(ncp: INixieControlPanel, pump: Pump) {
+        super(ncp, pump);
+        // this.pump = pump;
+        // this._targetSpeed = 0;
+    }
+
+    public setTargetSpeed(pumpState: PumpState) {
+        let newSpeed = 0;
+        if (!pumpState.pumpOnDelay) {
+            let circuitConfigs = this.pump.circuits.get();
+            for (let i = 0; i < circuitConfigs.length; i++) {
+                let circuitConfig = circuitConfigs[i];
+                let circ = state.circuits.getInterfaceById(circuitConfig.circuit);
+                if (circ.isOn) newSpeed = Math.max(newSpeed, circuitConfig.speed);
+            }
+        }
+        if (isNaN(newSpeed)) newSpeed = 0;
+        this._targetSpeed = newSpeed;
+        if (this._targetSpeed !== 0) Math.min(Math.max(this.pump.minSpeed, this._targetSpeed), this.pump.maxSpeed);
+        if (this._targetSpeed !== newSpeed) logger.info(`NCP: Setting Pump ${this.pump.name} to ${newSpeed} RPM.`);
+    }
+    
+    public async setServiceModeAsync() {
+        this._targetSpeed = 0;
+        await this.setDriveStateAsync(false);
+        // await this.setPumpToRemoteControlAsync(false);
+    }
+
+    public async setPumpStateAsync(pstate: PumpState) {
+        // Don't poll while we are seting the state.
+        this.suspendPolling = true;
+        try {
+            let pt = sys.board.valueMaps.pumpTypes.get(this.pump.type);
+            if (state.mode === 0) {
+                // Since these process are async the closing flag can be set
+                // between calls.  We need to check it in between each call.
+                if (!this.closing) {
+                    if (this._targetSpeed >= pt.minSpeed && this._targetSpeed <= pt.maxSpeed) await this.setPumpRPMAsync();
+                }
+                if (!this.closing) await this.setDriveStateAsync();
+                ;
+                // if (!this.closing && pt.name !== 'vsf' && pt.name !== 'vs') await this.setPumpFeatureAsync(6);;
+                if (!this.closing) await setTimeout(1000);;
+                if (!this.closing) await this.requestPumpStatusAsync();;
+                // if (!this.closing) await this.setPumpToRemoteControlAsync();;
+            }
+            return new InterfaceServerResponse(200, 'Success');
+        }
+        catch (err) {
+            logger.error(`Error running pump sequence for ${this.pump.name}: ${err.message}`);
+            return Promise.reject(err);
+        }
+        finally { this.suspendPolling = false; }
+    };
+    protected async setDriveStateAsync(isRunning: boolean = true) {
+        // Go command starts the motor spinning. Set Demand must be sent first. If the motor is already running, Go is ignored.
+        // In fault mode the drive may NACK Go/Stop; see RegalModbusStateMessage NACK handling.
+        let functionCode = this._targetSpeed > 0 ? 0x41 : 0x42;
+        logger.debug(`NixiePumpRegalModbus: setDriveStateAsync ${this.pump.name} ${functionCode == 0x41 ? 'RUN' : functionCode == 0x42 ? 'STOP' : 'UNKNOWN'}`);
+        try {
+            if (conn.isPortEnabled(this.pump.portId || 0)) {
+                let functionCode = this._targetSpeed > 0 ? 0x41 : 0x42;
+                let out = Outbound.create({
+                    portId: this.pump.portId || 0,
+                    protocol: Protocol.RegalModbus,
+                    dest: this.pump.address,
+                    action: functionCode,
+                    payload: [],
+                    retries: 0,
+                    response: false
+                });
+                try {
+                    await out.sendAsync();
+                }
+                catch (err) {
+                    logger.error(`Error sending setDriveState for ${this.pump.name}: ${err.message}`);
+                }
+            }
+            else {
+                let pumpState = state.pumps.getItemById(this.pump.id);
+                pumpState.command = pumpState.rpm > 0 || pumpState.flow > 0 ? 10 : 0;  // dashPanel needs this to be set to 10 for running.
+            }
+        } catch (err) { logger.error(`Error setting driveState for ${this.pump.name}: ${err.message}`); }
+    };
+
+    protected async requestPumpDriveStateAsync() {
+        if (conn.isPortEnabled(this.pump.portId || 0)) {
+            let out = Outbound.create({
+                portId: this.pump.portId || 0,
+                protocol: Protocol.RegalModbus,
+                dest: this.pump.address,
+                action: 0x43,
+                payload: [],
+                retries: 2,
+                response: true,
+            });
+            try {
+                await out.sendAsync();
+            }
+            catch (err) {
+                logger.error(`Error sending requestPumpDriveState for ${this.pump.name}: ${err.message}`);
+            }
+        }
+    }
+
+    protected async requestSensorAsync(page: number, sensorAddr: number, retries: number = 2) {
+        if (conn.isPortEnabled(this.pump.portId || 0)) {
+            let out = Outbound.create({
+                portId: this.pump.portId || 0,
+                protocol: Protocol.RegalModbus,
+                dest: this.pump.address,
+                action: 0x45,
+                payload: [page, sensorAddr],
+                retries: retries,
+                response: true,
+            });
+            try {
+                await out.sendAsync();
+            }
+            catch (err) {
+                logger.error(`Error sending requestSensor for ${this.pump.name} page ${page} sensor ${sensorAddr}: ${err.message}`);
+            }
+        }
+    }
+
+    protected async requestPumpStatusAsync() {
+
+        await this.requestPumpDriveStateAsync();
+        await this.requestSensorAsync(0, 0x00);  // motor speed
+        // await this.requestSensorAsync(0, 0x01);  // motor current
+        // await this.requestSensorAsync(0, 0x04);  // torque
+        // await this.requestSensorAsync(0, 0x05);  // inverter input power
+        // await this.requestSensorAsync(0, 0x06);  // DC bus voltage
+        // await this.requestSensorAsync(0, 0x07);  // ambient temperature
+        await this.requestSensorAsync(0, 0x0A);  // output power
+        // await this.requestSensorAsync(0, 0x0D);  // motor line voltage
+        // await this.requestSensorAsync(0, 0x0E);  // ramp status
+        // await this.requestSensorAsync(0, 0x0F);  // no of total fault
+        // await this.requestSensorAsync(0, 0x10);  // prime status
+        // await this.requestSensorAsync(0, 0x11);  // motor input power
+        // await this.requestSensorAsync(0, 0x12);  // IGBT temperature
+        // await this.requestSensorAsync(0, 0x13);  // PCB temperature
+    };
+
+    protected async setPumpRPMAsync() {
+        logger.debug(`NixiePumpRegalModbus: setPumpRPMAsync ${this.pump.name} ${this._targetSpeed}`);
+        if (conn.isPortEnabled(this.pump.portId || 0)) {
+            // get demand bytes from rpm
+            const mode = 0x00; // 0x00 for speed control mode
+            const demandLo = Math.round(this._targetSpeed * 4) & 0xFF;
+            const demandHi = (Math.round(this._targetSpeed * 4) >> 8) & 0xFF;
+            let out = Outbound.create({
+                portId: this.pump.portId || 0,
+                protocol: Protocol.RegalModbus,
+                dest: this.pump.address,
+                action: 0x44,
+                payload: [mode, demandLo, demandHi],
+                retries: 1,
+                // timeout: 250,
+                response: true
+            });
+            try {
+                await out.sendAsync();
+            }
+            catch (err) {
+                logger.error(`Error sending setPumpRPMAsync for ${this.pump.name}: ${err.message}`);
+            }
+        }
+    };
+    public async closeAsync() {
+        try {
+            this.suspendPolling = true;
+            logger.info(`Nixie Pump closing ${this.pump.name}.`)
+            if (typeof this._pollTimer !== 'undefined' || this._pollTimer) clearTimeout(this._pollTimer);
+            this._pollTimer = null;
+            this.closing = true;
+            let pumpType = sys.board.valueMaps.pumpTypes.get(this.pump.type);
+            let pumpState = state.pumps.getItemById(this.pump.id);
+            this._targetSpeed = 0;
+            await this.setDriveStateAsync(false);
+            // if (!this.closing && pt.name !== 'vsf' && pt.name !== 'vs') await this.setPumpFeatureAsync();
+            //await this.setPumpFeature(); 
+            //await this.setDriveStateAsync(false); 
+            // await this.setPumpToRemoteControlAsync(false);
+            // Make sure the polling timer is dead after we have closed this all off.  That way we do not
+            // have another process that revives it from the dead.
+            if (typeof this._pollTimer !== 'undefined' || this._pollTimer) clearTimeout(this._pollTimer);
+            this._pollTimer = null;
+            pumpState.emitEquipmentChange();
+        }
+        catch (err) { logger.error(`Nixie Pump closeAsync: ${err.message}`); return Promise.reject(err); }
+        finally { this.suspendPolling = false; }
+    }
+}
+
+export class NixiePumpNeptuneModbus extends NixiePump {
+    private static readonly REG_MOTOR_ON_OFF = 0;    // 40001 address offset
+    private static readonly REG_MANUAL_SPEED = 1;    // 40002 address offset
+
+    constructor(ncp: INixieControlPanel, pump: Pump) {
+        super(ncp, pump);
+    }
+
+    public setTargetSpeed(pumpState: PumpState) {
+        let newSpeed = 0;
+        if (!pumpState.pumpOnDelay) {
+            const circuitConfigs = this.pump.circuits.get();
+            for (let i = 0; i < circuitConfigs.length; i++) {
+                const circuitConfig = circuitConfigs[i];
+                const circ = state.circuits.getInterfaceById(circuitConfig.circuit);
+                if (circ.isOn) newSpeed = Math.max(newSpeed, circuitConfig.speed);
+            }
+        }
+        if (isNaN(newSpeed)) newSpeed = 0;
+        this._targetSpeed = newSpeed;
+        if (this._targetSpeed !== 0) Math.min(Math.max(this.pump.minSpeed, this._targetSpeed), this.pump.maxSpeed);
+        if (this._targetSpeed !== newSpeed) logger.info(`NCP: Setting Pump ${this.pump.name} to ${newSpeed} RPM.`);
+    }
+
+    public async setServiceModeAsync() {
+        this._targetSpeed = 0;
+        await this.setDriveStateAsync(false);
+    }
+
+    public async setPumpStateAsync(pstate: PumpState) {
+        this.suspendPolling = true;
+        try {
+            const pt = sys.board.valueMaps.pumpTypes.get(this.pump.type);
+            if (state.mode === 0) {
+                if (!this.closing && this._targetSpeed >= pt.minSpeed && this._targetSpeed <= pt.maxSpeed) {
+                    await this.setPumpRPMAsync();
+                }
+                if (!this.closing) await this.setDriveStateAsync();
+                if (!this.closing) await setTimeout(500);
+                if (!this.closing) await this.requestPumpStatusAsync();
+            }
+            return new InterfaceServerResponse(200, 'Success');
+        }
+        catch (err) {
+            logger.error(`Error running pump sequence for ${this.pump.name}: ${err.message}`);
+            return Promise.reject(err);
+        }
+        finally { this.suspendPolling = false; }
+    };
+
+    private toWord(value: number): [number, number] {
+        return [(value >> 8) & 0xFF, value & 0xFF];
+    }
+
+    private async writeSingleRegisterAsync(registerAddr: number, value: number, retries: number = 1) {
+        if (!conn.isPortEnabled(this.pump.portId || 0)) return;
+        const [regHi, regLo] = this.toWord(registerAddr);
+        const [valHi, valLo] = this.toWord(value & 0xFFFF);
+        const out = Outbound.create({
+            portId: this.pump.portId || 0,
+            protocol: Protocol.NeptuneModbus,
+            dest: this.pump.address,
+            action: 0x06,
+            payload: [regHi, regLo, valHi, valLo],
+            retries,
+            response: true,
+        });
+        try {
+            await out.sendAsync();
+        }
+        catch (err) {
+            logger.error(`Error writing Neptune register ${registerAddr} for ${this.pump.name}: ${err.message}`);
+        }
+    }
+
+    private async readInputRegistersAsync(startAddr: number, quantity: number, retries: number = 2) {
+        if (!conn.isPortEnabled(this.pump.portId || 0)) return;
+        const [startHi, startLo] = this.toWord(startAddr);
+        const [qtyHi, qtyLo] = this.toWord(quantity);
+        const out = Outbound.create({
+            portId: this.pump.portId || 0,
+            protocol: Protocol.NeptuneModbus,
+            dest: this.pump.address,
+            action: 0x04,
+            payload: [startHi, startLo, qtyHi, qtyLo],
+            retries,
+            response: true,
+        });
+        NeptuneModbusStateMessage.enqueueReadRequest(this.pump.address, startAddr, quantity);
+        try {
+            await out.sendAsync();
+        }
+        catch (err) {
+            NeptuneModbusStateMessage.clearReadRequests(this.pump.address);
+            logger.error(`Error reading Neptune registers ${startAddr}-${startAddr + quantity - 1} for ${this.pump.name}: ${err.message}`);
+        }
+    }
+
+    protected async setDriveStateAsync(isRunning: boolean = true) {
+        const shouldRun = isRunning && this._targetSpeed > 0;
+        logger.debug(`NixiePumpNeptuneModbus: setDriveStateAsync ${this.pump.name} ${shouldRun ? 'RUN' : 'STOP'}`);
+        await this.writeSingleRegisterAsync(NixiePumpNeptuneModbus.REG_MOTOR_ON_OFF, shouldRun ? 1 : 0);
+    }
+
+    protected async requestPumpStatusAsync() {
+        // Block 30001-30007 (speed/power/fault summary).
+        await this.readInputRegistersAsync(0, 7);
+        // Block 30031-30033 (interface fault state/code).
+        await this.readInputRegistersAsync(30, 3);
+        // Block 30114-30128 (stopped state, line volts, temps, target speed, etc.).
+        await this.readInputRegistersAsync(113, 15);
+    }
+
+    protected async setPumpRPMAsync() {
+        logger.debug(`NixiePumpNeptuneModbus: setPumpRPMAsync ${this.pump.name} ${this._targetSpeed}`);
+        await this.writeSingleRegisterAsync(NixiePumpNeptuneModbus.REG_MANUAL_SPEED, Math.round(this._targetSpeed));
+    }
+
+    public async closeAsync() {
+        try {
+            this.suspendPolling = true;
+            logger.info(`Nixie Pump closing ${this.pump.name}.`)
+            if (typeof this._pollTimer !== 'undefined' || this._pollTimer) clearTimeout(this._pollTimer);
+            this._pollTimer = null;
+            this.closing = true;
+            const pumpState = state.pumps.getItemById(this.pump.id);
+            this._targetSpeed = 0;
+            await this.setDriveStateAsync(false);
+            if (typeof this._pollTimer !== 'undefined' || this._pollTimer) clearTimeout(this._pollTimer);
+            this._pollTimer = null;
+            pumpState.emitEquipmentChange();
+        }
+        catch (err) { logger.error(`Nixie Pump closeAsync: ${err.message}`); return Promise.reject(err); }
+        finally { this.suspendPolling = false; }
+    }
 }

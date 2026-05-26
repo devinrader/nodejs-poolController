@@ -29,6 +29,7 @@ import { InvalidEquipmentDataError, InvalidOperationError, OutboundMessageError 
 import { state } from "../State";
 import { Inbound, Message, Outbound, Response } from './messages/Messages';
 import { sl } from './ScreenLogic';
+import { icws } from './IntelliCenterWS';
 const extend = require("extend");
 export class Connection {
     constructor() { }
@@ -131,17 +132,52 @@ export class Connection {
                 if (password.length !== 4) return Promise.reject(new InvalidEquipmentDataError(`An invalid password was supplied for Screenlogic ${password}. (Length must be <= 4)}`, 'Screenlogic', data));
                 pdata.screenlogic = data.screenlogic;
             }
+            if (pdata.type === 'ocpws') {
+                let oc = (data && data.ocpws) || {};
+                let host = typeof oc.host === 'string' ? oc.host.trim() : '';
+                let port = typeof oc.port === 'number' ? oc.port : parseInt(oc.port, 10);
+                if (!host) return Promise.reject(new InvalidEquipmentDataError(`An OCP WebSocket host is required when type='ocpws'.`, 'IntelliCenterWS', data));
+                if (isNaN(port) || port <= 0 || port > 65535) port = 6680;
+                pdata.ocpws = {
+                    host,
+                    port,
+                    alias: typeof oc.alias === 'string' ? oc.alias : (pdata.ocpws && pdata.ocpws.alias) || '',
+                    reconnectMs: typeof oc.reconnectMs === 'number' ? oc.reconnectMs : (pdata.ocpws && pdata.ocpws.reconnectMs) || 5000,
+                    messageTimeoutMs: typeof oc.messageTimeoutMs === 'number' ? oc.messageTimeoutMs : (pdata.ocpws && pdata.ocpws.messageTimeoutMs) || 10000,
+                };
+            }
             let existing = this.findPortById(portId);
             if (typeof existing !== 'undefined')
                 if (existing.type === 'screenlogic' || sl.enabled) {
                     await sl.closeAsync();
                 }
+                else if (existing.type === 'ocpws' || icws.enabled) {
+                    await icws.closeAsync();
+                    if (await existing.closeAsync() === false) {
+                        existing.closing = false;
+                    }
+                }
                 else {
                     if (!await existing.closeAsync()) {
                         existing.closing = false;  // if closing fails, reset flag so user can try again
-                        return Promise.reject(new InvalidOperationError(`Unable to close the current RS485 port`, 'setPortAsync'));
+                        return Promise.reject(new InvalidOperationError(`Unable to close the current RS485 port (Try to save the port again as it usually works the second time).`, 'setPortAsync'));
                     }
                 }
+            // Belt-and-braces: when switching INTO a non-RS485 transport, ensure
+            // every RS-485 port on this connection is closed so we never have
+            // both buses live at once.
+            if (pdata.type === 'screenlogic' || pdata.type === 'ocpws') {
+                for (let i = 0; i < this.rs485Ports.length; i++) {
+                    const p = this.rs485Ports[i];
+                    if (p && p.isOpen) {
+                        try { await p.closeAsync(); } catch (e) { logger.warn(`setPortAsync: failed closing RS485 port ${p.portId}: ${e.message}`); }
+                    }
+                }
+            }
+            // When switching back to an RS-485-style transport, ensure the WS is closed.
+            if (pdata.type !== 'ocpws' && icws.isOpen) {
+                try { await icws.closeAsync(); } catch (e) { logger.warn(`setPortAsync: failed closing icws: ${e.message}`); }
+            }
             config.setSection(section, pdata);
             let cfg = config.getSection(section, {
                 type: 'local',
@@ -167,6 +203,11 @@ export class Connection {
                 if (pdata.type === 'screenlogic') {
                     await sl.openAsync();
                 }
+                else if (pdata.type === 'ocpws') {
+                    if (!await icws.openAsync()) {
+                        return Promise.reject(new InvalidOperationError(`Unable to open IntelliCenter WebSocket connection to ${pdata.ocpws?.host}:${pdata.ocpws?.port}`, 'setPortAsync'));
+                    }
+                }
                 else {
                     existing.reconnects = 0;
                     //existing.emitPortStats();
@@ -181,6 +222,7 @@ export class Connection {
     }
     public async stopAsync() {
         try {
+            try { await icws.closeAsync(); } catch (e) { logger.warn(`stopAsync: icws close failed: ${e.message}`); }
             for (let i = this.rs485Ports.length - 1; i >= 0; i--) {
                 let port = this.rs485Ports[i];
                 await port.closeAsync();
@@ -190,15 +232,32 @@ export class Connection {
     }
     public async initAsync() {
         try {
+            Message.publishPluginAddress();
             // So now that we are now allowing multiple comm ports we need to initialize each one.  We are keeping the comms section from the config.json
             // simply because I have no idea what the Docker folks do with this.  So the default comms will be the one with an OCP or if there are no aux ports.
             let cfg = config.getSection('controller');
+            // First pass: detect if any port is configured for the IntelliCenter local WS transport.
+            // It is mutually exclusive with RS-485 — when WS is the active transport we do NOT
+            // open any serial/socat ports.
+            let wsPortConfig: any;
+            for (let section in cfg) {
+                if (section.startsWith('comms')) {
+                    let c = cfg[section];
+                    if (c && c.type === 'ocpws' && c.enabled) { wsPortConfig = c; break; }
+                }
+            }
+            if (typeof wsPortConfig !== 'undefined') {
+                logger.info(`Comms.initAsync: IntelliCenter WS transport selected (${wsPortConfig.ocpws?.host}:${wsPortConfig.ocpws?.port}); RS-485 ports will not be opened.`);
+                try { await icws.openAsync(); }
+                catch (e) { logger.error(`Comms.initAsync: icws open failed: ${e.message}`); }
+                return;
+            }
             for (let section in cfg) {
                 if (section.startsWith('comms')) {
                     let c = cfg[section];
                     if (typeof c.type === 'undefined') {
                         let type = 'local';
-                        if (c.mockPort) type = 'mock';
+                        if (c.mock) type = 'mock';
                         else if (c.netConnect) type = 'network';
                         config.setSection(`controller.${section}`, c);
                         console.log(section);
@@ -260,7 +319,7 @@ export class Connection {
         if (anslq25port >= 0) {
             let ports = this.rs485Ports;
             for (let i = 0; i < ports.length; i++) {
-                // if (ports[i].mockPort) continue;
+                // if (ports[i].mock) continue;
                 if (ports[i].portId === currPort.portId) continue;
                 if (ports[i].portId === anslq25port) continue; // don't resend
                 if (!ports[i].isOpen) continue;
@@ -359,6 +418,16 @@ export class Connection {
     public queueSendMessage(msg: Outbound) {
         let port = this.findPortById(msg.portId);
         if (typeof port !== 'undefined') {
+            if (port.mock) {
+                msg.retries = 0;
+                if (msg.requiresResponse) msg.response = undefined;
+            }
+            const vEquip = sys.virtualEquipment;
+            if (vEquip && vEquip.shouldAnswerOutbound(msg)) {
+                vEquip.processOutbound(msg);
+                msg.retries = 0;
+                if (msg.requiresResponse) msg.response = undefined;
+            }
             port.emitter.emit('messagewrite', msg);
         }
         else
@@ -368,6 +437,15 @@ export class Connection {
     public async queueSendMessageAsync(msg: Outbound): Promise<boolean> {
         return new Promise(async (resolve, reject) => {
 
+            // Hard mutual-exclusion guard: when IntelliCenter local WS is the
+            // active transport, no RS-485 frame may be written to the bus.
+            // This is defense-in-depth — setPortAsync/initAsync should already
+            // have prevented any RS-485 port from being opened.
+            if (icws && icws.enabled && icws.isOpen) {
+                const err = new OutboundMessageError(msg, `Refusing to send RS-485 packet while IntelliCenter WS transport is active.`);
+                logger.error(err.message);
+                return reject(err);
+            }
 
             let port = this.findPortById(msg.portId);
 
@@ -375,12 +453,28 @@ export class Connection {
                 logger.error(`queueSendMessage: Message was targeted for undefined port ${msg.portId || 0}`);
                 return;
             }
+            // In mock mode:
+            // - never retry the same outbound packet multiple times
+            // - never wait for responses (so API callers get "sent" semantics)
+            if (port.mock) {
+                msg.retries = 0;
+                if (msg.requiresResponse) msg.response = undefined;
+            }
+            const vEquip = sys.virtualEquipment;
+            if (vEquip && vEquip.shouldAnswerOutbound(msg)) {
+                vEquip.processOutbound(msg);
+                msg.retries = 0;
+                if (msg.requiresResponse) msg.response = undefined;
+                resolve(true);
+                return;
+            }
             // also send to other broadcast ports
             // let msgs = conn.queueOutboundToAnslq25(msg);
             let msgs = [];
             // conn.queueInboundToBroadcast(msg);
             conn.queueOutboundToBroadcast(msg);
-            /* if (msgs.length > 0) {
+            /* if (msgs.le
+            ngth > 0) {
                 msgs.push(msg);
                 let promises: Promise<boolean>[] = [];
                 for (let i = 0; i < msgs.length; i++) {
@@ -497,6 +591,14 @@ export class RS485Port {
         this._outBuffer = [];
         this.procTimer = null;
         this.emitter.on('messagewrite', (msg) => { this.pushOut(msg); });
+        this.emitter.on('messagewritepriority', (msg) => {
+            if (this.isOpen && this.isRTS) {
+                this.writeMessage(msg);
+            } else {
+                this._outBuffer.unshift(msg);
+                setImmediate(() => { this.processPackets(); });
+            }
+        });
         this.emitter.on('mockmessagewrite', (msg) => {
             let bytes = msg.toPacket();
             this.counter.bytesSent += bytes.length;
@@ -511,7 +613,7 @@ export class RS485Port {
     public reconnects: number = 0;
     public emitter: EventEmitter;
     public get portId() { return typeof this._cfg !== 'undefined' && typeof this._cfg.portId !== 'undefined' ? this._cfg.portId : 0; }
-    public get type() { return typeof this._cfg.type !== 'undefined' ? this._cfg.type : this._cfg.netConnect ? 'netConnect' : this._cfg.mockPort || this._cfg.mock ? 'mock' : 'local' };
+    public get type() { return typeof this._cfg.type !== 'undefined' ? this._cfg.type : this._cfg.netConnect ? 'netConnect' : this._cfg.mock ? 'mock' : 'local' };
     public isOpen: boolean = false;
     public closing: boolean = false;
     private _cfg: any;
@@ -525,6 +627,8 @@ export class RS485Port {
     private procTimer: NodeJS.Timeout;
     public writeTimer: NodeJS.Timeout
     private _processing: boolean = false;
+    private _lastTx: number = 0;
+    private _lastRx: number = 0;
     private _inBytes: number[] = [];
     private _inBuffer: number[] = [];
     private _outBuffer: Outbound[] = [];
@@ -682,7 +786,7 @@ export class RS485Port {
                 // be open if a hardware interface is used and this method returns.
                 sp.open((err) => {
                     if (err) {
-                        this.resetConnTimer();
+                        if (!this.mock) this.resetConnTimer();
                         this.isOpen = false;
                         logger.error(`Error opening port ${this.portId}: ${err.message}. ${this._cfg.inactivityRetry > 0 && !this.mock ? `Retry in ${this._cfg.inactivityRetry} seconds` : `Never retrying; (fwiw, inactivityRetry set to ${this._cfg.inactivityRetry})`}`);
                         resolve(false);
@@ -712,7 +816,7 @@ export class RS485Port {
                         if (!this.mock && !this.isPaused) this.resetConnTimer();
                         this.pushIn(data);
                     });
-                    this.resetConnTimer();
+                    if (!this.mock) this.resetConnTimer();
                     this.emitPortStats();
                 });
                 sp.on('close', (err) => {
@@ -730,7 +834,7 @@ export class RS485Port {
                     if (typeof this.writeTimer !== 'undefined') { clearTimeout(this.writeTimer); this.writeTimer = null; }
                     this.isOpen = false;
                     if (sp.isOpen) sp.close((err) => { }); // call this with the error callback so that it doesn't emit to the error again.
-                    this.resetConnTimer();
+                    if (!this.mock) this.resetConnTimer();
                     logger.error(`Serial Port ${this.portId}: An error occurred : ${this._cfg.rs485Port}: ${JSON.stringify(err)}`);
                     this.emitPortStats();
 
@@ -823,7 +927,7 @@ export class RS485Port {
     protected resetConnTimer(...args) {
         //console.log(`resetting connection timer`);
         if (this.connTimer !== null) clearTimeout(this.connTimer);
-        if (!this._cfg.mockPort && this._cfg.inactivityRetry > 0 && !this.closing) this.connTimer = setTimeout(async () => {
+        if (!this._cfg.mock && this._cfg.inactivityRetry > 0 && !this.closing) this.connTimer = setTimeout(async () => {
             try {
                 if (this._cfg.netConnect)
                     logger.warn(`Inactivity timeout for ${this.portId} serial port ${this._cfg.netHost}:${this._cfg.netPort}/${this._cfg.rs485Port} after ${this._cfg.inactivityRetry} seconds`);
@@ -861,42 +965,40 @@ export class RS485Port {
                 (this._port as net.Socket).write(bytes, 'binary', cb);
         }
         else {
-            if (this._port instanceof SerialPortMock && this.mock === true) {
-                msg.processMock();
-                cb();
-            }
-            else {
-
-                this.writeTimer = setTimeout(() => {
-                    // RSG - I ran into a scenario where the underlying stream
-                    // processor was not retuning the CB and comms would 
-                    // completely stop.  This timeout is a failsafe.
-                    // Further, the underlying stream may throw an event error 
-                    // and not call the callback (per node docs) hence the
-                    // public writeTimer.
+            // For mock ports, we still want to exercise the real outbound send pipeline:
+            // - log + emit to dashpanel via logger.packet(msg) in writeMessage()
+            // - write the exact bytes that would have been sent
+            // Do NOT loop outbound messages back into inbound processing here; mock/replay injects inbound separately.
+            this.writeTimer = setTimeout(() => {
+                // RSG - I ran into a scenario where the underlying stream
+                // processor was not retuning the CB and comms would 
+                // completely stop.  This timeout is a failsafe.
+                // Further, the underlying stream may throw an event error 
+                // and not call the callback (per node docs) hence the
+                // public writeTimer.
+                if (typeof cb === 'function') {
+                    cb = undefined;
+                    _cb(new Error(`Serialport stream has not called the callback in 3s.`));
+                }
+            }, 3000);
+            (this._port as any).write(bytes, (err) => {
+                if (typeof this.writeTimer !== 'undefined') {
+                    clearTimeout(this.writeTimer);
+                    this.writeTimer = null;
                     if (typeof cb === 'function') {
                         cb = undefined;
-                        _cb(new Error(`Serialport stream has not called the callback in 3s.`));
+                        _cb(err);
                     }
-                }, 3000);
-                this._port.write(bytes, (err) => {
-                    if (typeof this.writeTimer !== 'undefined') {
-                        clearTimeout(this.writeTimer);
-                        this.writeTimer = null;
-                        // resolve();
-                        if (typeof cb === 'function') {
-                            cb = undefined;
-                            _cb(err);
-                        }
-                    }
-                });
-            }
+                }
+            });
 
         }
     }
     // make public for now; should enable writing directly to mock port at Conn level...
     public pushIn(pkt: Buffer) {
-        this._inBuffer.push.apply(this._inBuffer, pkt.toJSON().data); if (sys.isReady) setImmediate(() => { this.processPackets(); });
+        this._inBuffer.push.apply(this._inBuffer, pkt.toJSON().data);
+        this._lastRx = Date.now();
+        if (sys.isReady) setImmediate(() => { this.processPackets(); });
     }
     private pushOut(msg) {
         this._outBuffer.push(msg); setImmediate(() => { this.processPackets(); });
@@ -944,9 +1046,16 @@ export class RS485Port {
             let timeout = this._waitingPacket.timeout || 1000;
             let dt = new Date();
             if (this._waitingPacket.timestamp.getTime() + timeout < dt.getTime()) {
-                logger.silly(`Retrying outbound message after ${(dt.getTime() - this._waitingPacket.timestamp.getTime()) / 1000} secs with ${this._waitingPacket.remainingTries} attempt(s) left. - ${this._waitingPacket.toShortPacket()} `);
-                this.counter.sndRetries++;
-                this.writeMessage(this._waitingPacket);
+                if (this._waitingPacket.remainingTries > 0) {
+                    logger.silly(`Retrying outbound message after ${(dt.getTime() - this._waitingPacket.timestamp.getTime()) / 1000} secs with ${this._waitingPacket.remainingTries} attempt(s) left. - ${this._waitingPacket.toShortPacket()} `);
+                    this.counter.sndRetries++;
+                    this.writeMessage(this._waitingPacket);
+                }
+                else {
+                    // No retries remaining; fail the message (writeMessage will abort without writing).
+                    logger.silly(`Outbound message timed out after ${(dt.getTime() - this._waitingPacket.timestamp.getTime()) / 1000} secs with no retries remaining. - ${this._waitingPacket.toShortPacket()} `);
+                    this.writeMessage(this._waitingPacket);
+                }
             }
             return true;
         }
@@ -987,9 +1096,11 @@ export class RS485Port {
         // but this condition would be eval'd before the callback of port.write was calls and the outbound packet
         // would be sitting idle for eternity. 
         if (this._outBuffer.length > 0 || typeof this._waitingPacket !== 'undefined' || this._waitingPacket || typeof msg !== 'undefined') {
-            // Come back later as we still have items to send.
+            // Configurable inter-frame delay (default 30ms) overrides fixed 100ms.
+            const dCfg = (config.getSection('controller').txDelays || {});
+            const interFrame = Math.max(0, Number(dCfg.interFrameDelayMs || 30));
             let self = this;
-            this.procTimer = setTimeout(() => self.processPackets(), 100);
+            this.procTimer = setTimeout(() => self.processPackets(), interFrame);
         }
     }
     private writeMessage(msg: Outbound) {
@@ -1003,6 +1114,14 @@ export class RS485Port {
             var bytes = msg.toPacket();
             if (this.isOpen) {
                 this.isRTS = false;  // only set if port is open, otherwise it won't be set back to true
+                // ISSUE-121: Close the race window between _outBuffer.shift() (in processOutboundPackets)
+                // and completeWrite setting _waitingPacket. The mock port (and fast hardware) can deliver
+                // the inbound response BEFORE the async port.write callback fires, leaving the message
+                // untracked in clearResponses(). Set _waitingPacket here, before port.write, so any
+                // inbound matcher always finds it.
+                if (msg.requiresResponse && msg.remainingTries > 0) {
+                    this._waitingPacket = msg;
+                }
                 if (msg.remainingTries <= 0) {
                     // It will almost never fall into here.  The rare case where
                     // we have an RTS semaphore and a waiting response might make it go here.
@@ -1021,10 +1140,44 @@ export class RS485Port {
                     this.isRTS = true;
                     return;
                 }
-                this.counter.bytesSent += bytes.length;
-                msg.timestamp = new Date();
-                logger.packet(msg);
-                this.write(msg, (err) => {
+                const dCfg = (config.getSection('controller').txDelays || {});
+                const idleBeforeTx = Math.max(0, Number(dCfg.idleBeforeTxMs || 0));
+                const interByte = Math.max(0, Number(dCfg.interByteDelayMs || 0));
+                const now = Date.now();
+                const idleElapsed = now - Math.max(this._lastTx, this._lastRx);
+                const doWrite = () => {
+                    this.counter.bytesSent += bytes.length;
+                    msg.timestamp = new Date();
+                    logger.packet(msg);
+                    if (interByte > 0 && bytes.length > 1 && this._port && (this._port instanceof SerialPort || this._port instanceof SerialPortMock)) {
+                        // Manual inter-byte pacing
+                        let idx = 0;
+                        const writeNext = () => {
+                            if (idx >= bytes.length) {
+                                this._lastTx = Date.now();
+                                completeWrite(undefined);
+                                return;
+                            }
+                            const b = Buffer.from([bytes[idx++]]);
+                            (this._port as any).write(b, (err) => {
+                                if (err) {
+                                    this._lastTx = Date.now();
+                                    completeWrite(err);
+                                    return;
+                                }
+                                if (interByte > 0) setTimeout(writeNext, interByte);
+                                else setImmediate(writeNext);
+                            });
+                        };
+                        writeNext();
+                    } else {
+                        this.write(msg, (err) => {
+                            this._lastTx = Date.now();
+                            completeWrite(err);
+                        });
+                    }
+                };
+                const completeWrite = (err?: Error) => {
                     clearTimeout(this.writeTimer);
                     this.writeTimer = null;
                     msg.tries++;
@@ -1038,29 +1191,35 @@ export class RS485Port {
                             // make it onto the wire.
                             let error = new OutboundMessageError(msg, `Message aborted after ${msg.tries} attempt(s): ${err} `);
                             if (typeof msg.onComplete === 'function') msg.onComplete(error, undefined);
-                            self._waitingPacket = null;
+                            // ISSUE-121: Only clear _waitingPacket if it actually points to this msg.
+                            // A non-response write must not wipe an unrelated config request that's awaiting reply.
+                            if (self._waitingPacket === msg) self._waitingPacket = null;
                             self.counter.sndAborted++;
                         }
-                        return;
                     }
                     else {
                         logger.verbose(`Wrote packet [Port ${this.portId} id: ${msg.id}] [${bytes}].Retries remaining: ${msg.remainingTries} `);
                         // We have all the success we are going to get so if the call succeeded then
                         // don't set the waiting packet when we aren't actually waiting for a response.
                         if (!msg.requiresResponse) {
-                            // As far as we know the message made it to OCP.
-                            self._waitingPacket = null;
+                            // ISSUE-121: As far as we know the message made it to OCP.
+                            // Only clear _waitingPacket if it refers to THIS msg — pump answers and other
+                            // fire-and-forget writes must not clobber a different msg that is genuinely waiting
+                            // for a response (e.g. config Action 222 that we set as _waitingPacket pre-write).
+                            if (self._waitingPacket === msg) self._waitingPacket = null;
                             self.counter.sndSuccess++;
                             if (typeof msg.onComplete === 'function') msg.onComplete(err, undefined);
-
                         }
-                        else if (msg.remainingTries >= 0) {
-                            self._waitingPacket = msg;
-                        }
+                        else if (msg.remainingTries >= 0) self._waitingPacket = msg;
                     }
                     self.counter.updatefailureRate();
                     self.emitPortStats();
-                });
+                };
+                // Honor idle-before-TX if not enough bus quiet time has elapsed
+                if (idleBeforeTx > 0 && idleElapsed < idleBeforeTx) {
+                    const wait = idleBeforeTx - idleElapsed;
+                    setTimeout(doWrite, wait);
+                } else doWrite();
             }
         }
         catch (err) {
@@ -1084,7 +1243,10 @@ export class RS485Port {
         }
     }
     private clearResponses(msgIn: Inbound) {
-        if (this._outBuffer.length === 0 && typeof (this._waitingPacket) !== 'object' && this._waitingPacket) return;
+        // ISSUE-121: Original guard `_outBuffer.length === 0 && _waitingPacket` was buggy
+        // (always false unless waitingPacket existed AND buffer was empty).
+        // Correct early-exit: nothing to match against.
+        if (this._outBuffer.length === 0 && (typeof this._waitingPacket === 'undefined' || this._waitingPacket === null)) return;
         var callback;
         let msgOut = this._waitingPacket;
         if (typeof (this._waitingPacket) !== 'undefined' && this._waitingPacket) {
@@ -1106,18 +1268,26 @@ export class RS485Port {
         // triggers that cause the outbound message may come at the same time that another controller makes a call.
         var i = this._outBuffer.length - 1;
         while (i >= 0) {
-            let out = this._outBuffer[i--];
-            if (typeof out === 'undefined') continue;
+            const out = this._outBuffer[i];
+            if (typeof out === 'undefined') {
+                i--;
+                continue;
+            }
             let resp = out.response;
             // RG - added check for msgOut because the *Touch chlor packet 153 adds an status packet 217
             // but if it is the only packet on the queue the outbound will have been cleared out already.
-            if (out.requiresResponse && msgOut !== null) {
-                if (resp instanceof Response && resp.isResponse(msgIn, out) && (typeof out.scope === 'undefined' || out.scope === msgOut.scope)) {
+            // ISSUE-121: scope check now uses out.scope only — do NOT require scope match against msgOut
+            // (which is _waitingPacket, often unrelated to the buffered out being matched).
+            if (out.requiresResponse) {
+                if (resp instanceof Response && resp.isResponse(msgIn, out)) {
                     resp.message = msgIn;
                     if (typeof (resp.callback) === 'function' && resp.callback) callback = resp.callback;
                     this._outBuffer.splice(i, 1);
+                    // Resolve any async sender whose queued duplicate was satisfied by this inbound response.
+                    if (typeof out.onComplete === 'function') out.onComplete(undefined, msgIn);
                 }
             }
+            i--;
         }
         // RKS: This callback is important because we are managing queues. The position of this callback
         // occurs after all things related to the message have been processed including removal of subsequent

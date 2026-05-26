@@ -25,7 +25,7 @@ import { conn } from "./controller/comms/Comms";
 import { sys } from "./controller/Equipment";
 
 import { state } from "./controller/State";
-import { webApp } from "./web/Server";
+import { webApp, REMInterfaceServer } from "./web/Server";
 import * as readline from 'readline';
 import { sl } from './controller/comms/ScreenLogic'
 
@@ -50,8 +50,11 @@ export async function startPacketCapture(bResetLogs: boolean) {
         config.setSection('log', log);
         logger.startCaptureForReplay(bResetLogs);
         if (bResetLogs){
-            sys.resetSystem();
+            await sys.resetSystemAsync();
         }
+        
+        // Start packet capture on the REM server
+        await REMInterfaceServer.startPacketCaptureOnRemServer();
     }
     catch (err) {
         console.error(`Error starting replay: ${ err.message }`);
@@ -61,7 +64,12 @@ export async function stopPacketCaptureAsync() {
     let log = config.getSection('log');
     log.app.captureForReplay = false;
     config.setSection('log', log);
-    return logger.stopCaptureForReplayAsync();
+    
+    // Stop packet capture on the REM server and collect its logs
+    let remLogs = await REMInterfaceServer.stopPacketCaptureOnRemServer();
+    
+    // Pass REM logs to the logger for inclusion in the backup
+    return logger.stopCaptureForReplayAsync(remLogs);
 }
 export async function stopAsync(): Promise<void> {
     try {

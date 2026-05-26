@@ -7,6 +7,8 @@ RUN echo "Current working directory is: $(pwd)"
 
 COPY package*.json ./
 COPY defaultConfig.json config.json
+
+# Install all deps (including dev) for build
 RUN npm ci
 
 RUN ls
@@ -14,6 +16,8 @@ RUN ls
 RUN echo "Current working directory is: $(pwd)"
 
 COPY . .
+
+# Build Typescript
 RUN npm run build
 RUN npm ci --omit=dev
 

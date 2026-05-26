@@ -31,6 +31,8 @@ export class SunTouchBoard extends EasyTouchBoard {
     constructor(system: PoolSystem) {
         super(system); // graph chain to EasyTouchBoard constructor.
         this.valueMaps.expansionBoards = new byteValueMap([
+            // 33 added per #1108; 
+            [33, { name: 'stshared', part: '520820', desc: 'Pool and Spa controller', bodies: 2, valves: 4, circuits: 5, single: false, shared: true, dual: false, features: 4, chlorinators: 1, chemControllers: 1 }],
             [41, { name: 'stshared', part: '520820', desc: 'Pool and Spa controller', bodies: 2, valves: 4, circuits: 5, single: false, shared: true, dual: false, features: 4, chlorinators: 1, chemControllers: 1 }],
             [40, { name: 'stsingle', part: '520819', desc: 'Pool or Spa controller', bodies: 2, valves: 4, circuits: 5, single: true, shared: true, dual: false, features: 4, chlorinators: 1, chemControllers: 1 }]
         ]);
@@ -352,6 +354,7 @@ class SunTouchCircuitCommands extends TouchCircuitCommands {
                 return circ;
             }
             let typeByte = parseInt(data.type, 10) || circuit.type || sys.board.valueMaps.circuitFunctions.getValue('generic');
+            this.assertSinglePoolSpaType(id, typeByte);
             let nameByte = circuit.nameId; // You cannot change the Name Id in SunTouch.
             if (typeof data.nameId !== 'undefined') nameByte = data.nameId;
             let mappedId = id;

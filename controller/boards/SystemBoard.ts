@@ -19,7 +19,7 @@ import * as extend from 'extend';
 import { logger } from '../../logger/Logger';
 import { Message, Outbound } from '../comms/messages/Messages';
 import { Timestamp, utils } from '../Constants';
-import { Body, ChemController, ChemDoser, Chlorinator, Circuit, CircuitGroup, CircuitGroupCircuit, ConfigVersion, ControllerType, CustomName, CustomNameCollection, EggTimer, Equipment, Feature, Filter, General, Heater, ICircuit, ICircuitGroup, ICircuitGroupCircuit, LightGroup, LightGroupCircuit, Location, Options, Owner, PoolSystem, Pump, Schedule, sys, TempSensorCollection, Valve } from '../Equipment';
+import { Body, ChemController, ChemDoser, Chlorinator, Circuit, CircuitGroup, CircuitGroupCircuit, ConfigVersion, ControllerType, Cover, CustomName, CustomNameCollection, EggTimer, Equipment, Feature, Filter, General, Heater, ICircuit, ICircuitGroup, ICircuitGroupCircuit, LightGroup, LightGroupCircuit, Location, Options, Owner, PoolSystem, Pump, Remote, Schedule, sys, TempSensorCollection, Valve } from '../Equipment';
 import { EquipmentNotFoundError, InvalidEquipmentDataError, InvalidEquipmentIdError, BoardProcessError, InvalidOperationError } from '../Errors';
 import { ncp } from "../nixie/Nixie";
 import { HeaterState, BodyTempState, ChemControllerState, ChemDoserState, ChlorinatorState, CircuitGroupState, FilterState, ICircuitGroupState, ICircuitState, LightGroupState, ScheduleState, state, TemperatureState, ValveState, VirtualCircuitState } from '../State';
@@ -457,6 +457,8 @@ export class byteValueMaps {
         [5, { name: 'hybrid', desc: 'Hybrid', hasAddress: true }],
         [6, { name: 'mastertemp', desc: 'MasterTemp', hasAddress: true }],
         [7, { name: 'maxetherm', desc: 'Max-E-Therm', hasAddress: true }],
+        [8, { name: 'jxi', desc: 'Jandy JXi', hasAddress: true, defaultAddress: 104 }],
+        [9, { name: 'lxi', desc: 'Jandy LXi', hasAddress: true, defaultAddress: 56 }],
     ]);
     public heatModes: byteValueMap = new byteValueMap([
         [0, { name: 'off', desc: 'Off' }],
@@ -837,8 +839,9 @@ export class byteValueMaps {
     public delay: byteValueMap = new byteValueMap([
         [0, { name: 'nodelay', desc: 'No Delay' }],
         [32, { name: 'nodelay', desc: 'No Delay' }],
-        [34, { name: 'heaterdelay', desc: 'Heater Delay' }],
-        [36, { name: 'cleanerdelay', desc: 'Cleaner Delay' }]
+        [34, { name: 'heaterdelay', desc: 'Heater Cooldown Delay' }],
+        [36, { name: 'valvedelay', desc: 'Valve Delay' }],
+        [38, { name: 'freezedelay', desc: 'Freeze Delay' }]
     ]);
     public remoteTypes: byteValueMap = new byteValueMap([
         [0, { name: 'none', desc: 'Not Installed', maxButtons: 0 }],
@@ -909,6 +912,8 @@ export class SystemBoard {
     public features: FeatureCommands = new FeatureCommands(this);
     public chlorinator: ChlorinatorCommands = new ChlorinatorCommands(this);
     public heaters: HeaterCommands = new HeaterCommands(this);
+    public covers: CoverCommands = new CoverCommands(this);
+    public remotes: RemoteCommands = new RemoteCommands(this);
     public filters: FilterCommands = new FilterCommands(this);
     public chemControllers: ChemControllerCommands = new ChemControllerCommands(this);
     public chemDosers: ChemDoserCommands = new ChemDoserCommands(this);
@@ -1149,7 +1154,10 @@ export class SystemCommands extends BoardCommands {
         let tzOffsetObj = state.time.calcTZOffset();
         if (sys.general.options.clockSource === 'server' || typeof sys.general.location.timeZone === 'undefined') {
             let tzs = sys.board.valueMaps.timeZones.toArray();
-            sys.general.location.timeZone = tzs.find(tz => tz.utcOffset === tzOffsetObj.tzOffset).val;
+            let tzMatch = tzs.find(tz => tz.utcOffset === tzOffsetObj.tzOffset);
+            // Some environments can report offsets that are not present in the map.
+            // Keep the current value instead of throwing when no map entry exists.
+            if (typeof tzMatch !== 'undefined') sys.general.location.timeZone = tzMatch.val;
         }
         if (sys.general.options.clockSource === 'server' || typeof sys.general.options.adjustDST === 'undefined') {
             sys.general.options.adjustDST = tzOffsetObj.adjustDST;
@@ -1850,6 +1858,9 @@ export class BodyCommands extends BoardCommands {
             if (heatTypes.total > 1) heatModes.push(this.board.valueMaps.heatModes.transformByName('ultratemppref'));
         }
         return heatModes;
+    }
+    public getHeatModesV2(bodyId: number) {
+        return this.getHeatModes(bodyId);
     }
     public getPoolStates(): BodyTempState[] {
         let arrPools = [];
@@ -2627,7 +2638,10 @@ export class CircuitCommands extends BoardCommands {
         circ.level = level;
         return Promise.resolve(circ as ICircuitState);
     }
-    public getCircuitReferences(includeCircuits?: boolean, includeFeatures?: boolean, includeVirtual?: boolean, includeGroups?: boolean) {
+    public setLightColorAsync(id: number, color: { red: number; green: number; blue: number }): Promise<ICircuitState> {
+        return Promise.reject(new InvalidOperationError(`Light color control is not supported for circuit ${id}`, 'setLightColorAsync'));
+    }
+    public getCircuitReferences(includeCircuits?: boolean, includeFeatures?: boolean, includeVirtual?: boolean, includeGroups?: boolean, pumpCircuitsOnly?: boolean) {
         let arrRefs = [];
         if (includeCircuits) {
             // RSG: converted this to getItemByIndex because hasHeatSource isn't actually stored as part of the data
@@ -2647,6 +2661,7 @@ export class CircuitCommands extends BoardCommands {
             let vcs = sys.board.valueMaps.virtualCircuits.toArray();
             for (let i = 0; i < vcs.length; i++) {
                 let c = vcs[i];
+                if (pumpCircuitsOnly && c.assignableToPumpCircuit === false) continue;
                 arrRefs.push({ id: c.val, name: c.desc, equipmentType: 'virtual', assignableToPumpCircuit: c.assignableToPumpCircuit });
             }
         }
@@ -2679,9 +2694,25 @@ export class CircuitCommands extends BoardCommands {
     public getCircuitFunctions() {
         let cf = sys.board.valueMaps.circuitFunctions.toArray();
         if (!sys.equipment.shared) cf = cf.filter(x => { return x.name !== 'spillway' && x.name !== 'spadrain' });
+        // Do not omit pool/spa from this list when a pool/spa circuit already exists. The same payload is used to
+        // label the current circuit type in config UIs; filtering here makes the Pool/Spa row look blank/disabled.
+        // Uniqueness is enforced in assertSinglePoolSpaType when saving.
         return cf;
     }
     public getCircuitNames() { return [...sys.board.valueMaps.circuitNames.toArray(), ...sys.board.valueMaps.customNames.toArray()]; }
+    protected assertSinglePoolSpaType(id: number, type: number): void {
+        if (isNaN(type)) return;
+        const poolType = sys.board.valueMaps.circuitFunctions.findItem('pool');
+        const spaType = sys.board.valueMaps.circuitFunctions.findItem('spa');
+        let typeName: string;
+        if (typeof poolType !== 'undefined' && type === poolType.val) typeName = 'pool';
+        else if (typeof spaType !== 'undefined' && type === spaType.val) typeName = 'spa';
+        if (typeof typeName === 'undefined') return;
+        const dup = sys.circuits.find(elem => elem.isActive !== false && elem.id !== id && elem.type === type);
+        if (typeof dup !== 'undefined') {
+            throw new InvalidEquipmentDataError(`Only one ${typeName} circuit type is allowed. Circuit ${dup.id}-${dup.name} is already configured as ${typeName}.`, 'Circuit', type);
+        }
+    }
     public async setCircuitAsync(data: any, send: boolean = true): Promise<ICircuit> {
         try {
             let id = parseInt(data.id, 10);
@@ -2716,6 +2747,7 @@ export class CircuitCommands extends BoardCommands {
                 }
                 if (id === 6) circuit.type = sys.board.valueMaps.circuitFunctions.getValue('pool');
                 if (id === 1 && sys.equipment.shared) circuit.type = sys.board.valueMaps.circuitFunctions.getValue('spa');
+                this.assertSinglePoolSpaType(id, circuit.type);
                 if (typeof data.freeze !== 'undefined' || typeof circuit.freeze === 'undefined') circuit.freeze = utils.makeBool(data.freeze) || false;
                 if (typeof data.showInFeatures !== 'undefined' || typeof data.showInFeatures === 'undefined') circuit.showInFeatures = scircuit.showInFeatures = utils.makeBool(data.showInFeatures);
                 if (typeof data.dontStop !== 'undefined' && utils.makeBool(data.dontStop) === true) data.eggTimer = 1440;
@@ -3656,8 +3688,12 @@ export class ScheduleCommands extends BoardCommands {
         ssched.display = sched.display = display;
         ssched.startTimeOffset = sched.startTimeOffset = startTimeOffset;
         ssched.endTimeOffset = sched.endTimeOffset = endTimeOffset;
-        if (typeof sched.startDate === 'undefined')
+        // Nixie controller managing schedules (master = 1), physical OCP (master = 0)
+        if (sys.controllerType === ControllerType.Nixie) {
             sched.master = 1;
+        } else {
+            sched.master = 0;
+        }
         await ncp.schedules.setScheduleAsync(sched, data);
         // update end time in case sched is changed while circuit is on
         let cstate = state.circuits.getInterfaceById(sched.circuit);
@@ -4000,6 +4036,9 @@ export class HeaterCommands extends BoardCommands {
                     heater[s] = obj[s];
                 }
             }
+            let htype = sys.board.valueMaps.heaterTypes.transform(heater.type);
+            if (htype.hasAddress && !heater.address && htype.defaultAddress)
+                heater.address = htype.defaultAddress;
             let hstate = state.heaters.getItemById(id, true);
             //hstate.isVirtual = heater.isVirtual = true;
             hstate.name = heater.name;
@@ -4028,7 +4067,7 @@ export class HeaterCommands extends BoardCommands {
     public updateHeaterServices() {
         let htypes = sys.board.heaters.getInstalledHeaterTypes();
         let solarInstalled = htypes.solar > 0;
-        let heatPumpInstalled = htypes.heatpump > 0;
+        let heatPumpInstalled = htypes.heatpump > 0 || htypes.ultratemp > 0;
         let gasHeaterInstalled = htypes.gas > 0;
         if (sys.heaters.length > 0) sys.board.valueMaps.heatSources = new byteValueMap([[0, { name: 'off', desc: 'Off' }]]);
         if (gasHeaterInstalled) sys.board.valueMaps.heatSources.set(3, { name: 'heater', desc: 'Heater' });
@@ -4219,6 +4258,9 @@ export class HeaterCommands extends BoardCommands {
                     // so that if we have a heater preference set up then we do not have to evaluate the other heater.
                     let heaterTypes = sys.board.valueMaps.heaterTypes;
                     bodyHeaters.sort((a, b) => {
+                        // Sort master=1 (NCP-controlled) heaters before master=0 (OCP-controlled)
+                        // so directly controlled heaters get priority over OCP ghosts.
+                        if (a.master !== b.master) return b.master - a.master;
                         if (heaterTypes.transform(a.type).hasPreference) return -1;
                         else if (heaterTypes.transform(b.type).hasPreference) return 1;
                         return 0;
@@ -4296,11 +4338,11 @@ export class HeaterCommands extends BoardCommands {
                                         // This is the default operation on IntelliCenter and it appears to simply not start on the setpoint.  We can do better
                                         // than this by heating 1 degree past the setpoint then applying this rule for 30 minutes.  This allows for a more
                                         // responsive heater.
-                                        // 
+                                        //
                                         // For Ultratemp we need to determine whether the differential temp
                                         // is within range.  The other thing that needs to be calculated here is
                                         // whether Ultratemp can effeciently heat the pool.
-                                        if (mode === 'ultratemp' || mode === 'ultratemppref') {
+                                        if (mode === 'ultratemp' || mode === 'ultratemppref' || mode === 'heatpump' || mode === 'heatpumppref') {
                                             if (hstate.isOn) {
                                                 // For the preference mode we will try to reach the setpoint for a period of time then
                                                 // switch over to the gas heater.  Our algorithm for this is to check the rate of
@@ -4387,6 +4429,8 @@ export class HeaterCommands extends BoardCommands {
                                         break;
                                     case 'maxetherm':
                                     case 'gas':
+                                    case 'jxi':
+                                    case 'lxi':
                                         // If we make it here, the other heater is not heating the body.
                                         if (mode === 'heater' || mode === 'solarpref' || mode === 'heatpumppref' || mode === 'ultratemppref') {
                                             // Heat past the setpoint for the heater but only if the heater is currently on.
@@ -4430,7 +4474,7 @@ export class HeaterCommands extends BoardCommands {
                                         isOn = utils.makeBool(hstate.isOn);
                                         break;
                                 }
-                                logger.debug(`Heater Type: ${htype.name} Mode:${mode} Temp: ${body.temp} Setpoint: ${cfgBody.setPoint} Status: ${body.heatStatus}`);
+                                // logger.debug(`Heater Type: ${htype.name} Mode:${mode} Temp: ${body.temp} Setpoint: ${cfgBody.setPoint} Status: ${body.heatStatus}`);
                             }
                         }
                         else {
@@ -4441,6 +4485,8 @@ export class HeaterCommands extends BoardCommands {
                                     break;
                                 case 'maxetherm':
                                 case 'gas':
+                                case 'jxi':
+                                case 'lxi':
                                     if (hstatus === 'heater') isHeating = isOn = true;
                                     break;
                                 case 'hybrid':
@@ -5042,6 +5088,8 @@ export class ChemControllerCommands extends BoardCommands {
                 if (t.hasAddress) chem.address = address;
             }
             chem.isActive = true;
+            // IntelliChem standalone polling is only valid when Nixie is the controller.
+            if (t.name === 'intellichem' && sys.controllerType !== ControllerType.Nixie) data.intellichemStandalone = false;
             // So here is the thing.  If you have an OCP then the IntelliChem must be controlled by that.
             // the messages on the bus will talk back to the OCP so if you do not do this mayhem will ensue.
             if (t.name === 'intellichem') {
@@ -5260,5 +5308,18 @@ export class FilterCommands extends BoardCommands {
             sfilter.emitEquipmentChange();
             return filter;
         } catch (err) { logger.error(`deleteFilterAsync: Error deleting filter ${err.message}`); }
+    }
+}
+// ISSUE-080: Cover configuration write path. Base class rejects — only IntelliCenter implements
+// the Action 168 cat=14 outbound encoding. Kept controller-agnostic per AGENTS.md rule 7
+// (no controller-specific branching in SystemBoard).
+export class CoverCommands extends BoardCommands {
+    public async setCoverAsync(data: any): Promise<Cover> {
+        return Promise.reject(new InvalidOperationError(`Cover configuration is not supported on this controller`, 'setCoverAsync'));
+    }
+}
+export class RemoteCommands extends BoardCommands {
+    public async setRemoteAsync(data: any): Promise<Remote> {
+        return Promise.reject(new InvalidOperationError(`Remote configuration is not supported on this controller`, 'setRemoteAsync'));
     }
 }

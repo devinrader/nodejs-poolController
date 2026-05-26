@@ -136,6 +136,7 @@ export class Heliotrope {
             this.dt.getMonth() !== dt.getMonth() ||
             this.dt.getDate() !== dt.getDate()) {
             this.isCalculated = false;
+            this._warningSuppressed = false;
             // Always store a copy since we don't want to create instances where the change doesn't get reflected.  This
             // also could hold onto references that we don't want held for garbage cleanup.
             this.dt = typeof dt !== 'undefined' && typeof dt.getMonth === 'function' ? new Date(dt.getFullYear(), dt.getMonth(), dt.getDate(),
@@ -146,6 +147,7 @@ export class Heliotrope {
     public set longitude(lon: number) {
         if (this._longitude !== lon) {
             this.isCalculated = false;
+            this._warningSuppressed = false;
         }
         this._longitude = lon;
     }
@@ -153,12 +155,16 @@ export class Heliotrope {
     public set latitude(lat: number) {
         if (this._latitude !== lat) {
             this.isCalculated = false;
+            this._warningSuppressed = false;
         }
         this._latitude = lat;
     }
     public get zenith() { return this._zenith; }
     public set zenith(zen: number) {
-        if (this._zenith !== zen) this.isCalculated = false;
+        if (this._zenith !== zen) {
+            this.isCalculated = false;
+            this._warningSuppressed = false;
+        }
         this._zenith = zen;
     }
     private dt: Date;
@@ -171,6 +177,7 @@ export class Heliotrope {
     private _dtNextSunset: Date;
     private _dtPrevSunrise: Date;
     private _dtPrevSunset: Date;
+    private _warningSuppressed: boolean = false;
     public get isNight(): boolean {
         let times = this.calculatedTimes;
         if (this.isValid) {
@@ -213,8 +220,12 @@ export class Heliotrope {
             this.isCalculated = true;
             logger.verbose(`Calculated Heliotrope: sunrise:${Timestamp.toISOLocal(this._dtSunrise)} sunset:${Timestamp.toISOLocal(this._dtSunset)}`);
         }
-        else 
-            logger.warn(`dt:${this.dt} lat:${this._latitude} lon:${this._longitude} Not enough information to calculate Heliotrope.  See https://github.com/tagyoureit/nodejs-poolController/issues/245`);
+        else {
+            if (!this._warningSuppressed) {
+                logger.warn(`dt:${this.dt} lat:${this._latitude} lon:${this._longitude} Not enough information to calculate Heliotrope.  See https://github.com/tagyoureit/nodejs-poolController/issues/245`);
+                this._warningSuppressed = true;
+            }
+        }
     }
     public get sunrise(): Date {
         if (!this.isCalculated) this.calcInternal();
@@ -242,9 +253,11 @@ export class Heliotrope {
     }
     public get calculatedTimes(): { sunrise?: Date, sunset?: Date, nextSunrise?: Date, nextSunset?: Date, prevSunrise?: Date, prevSunset: Date, isValid: boolean } { return { sunrise: this.sunrise, sunset: this.sunset, nextSunrise: this.nextSunrise, nextSunset: this.nextSunset, prevSunrise: this.prevSunrise, prevSunset: this.prevSunset, isValid: this.isValid }; }
     public calcAdjustedTimes(dt: Date, hours = 0, min = 0): { sunrise?: Date, sunset?: Date, nextSunrise?: Date, nextSunset?: Date, prevSunrise?: Date, prevSunset: Date, isValid: boolean } {
+        if (!this.isValid) return { sunrise: undefined, sunset: undefined, nextSunrise: undefined, nextSunset: undefined, prevSunrise: undefined, prevSunset: undefined, isValid: false };
         if (this.dt.getFullYear() === dt.getFullYear() && this.dt.getMonth() === dt.getMonth() && this.dt.getDate() === dt.getDate()) return this.getAdjustedTimes(hours, min);
         let ms = (hours * 3600000) + (min * 60000);
         let times = this.calculate(dt);
+        if (!times.isValid) return { sunrise: undefined, sunset: undefined, nextSunrise: undefined, nextSunset: undefined, prevSunrise: undefined, prevSunset: undefined, isValid: false };
         return {
             sunrise: new Date(times.sunrise.getTime() + ms),
             sunset: new Date(times.sunset.getTime() + ms),
@@ -252,7 +265,7 @@ export class Heliotrope {
             nextSunset: new Date(times.nextSunset.getTime() + ms),
             prevSunrise: new Date(times.prevSunrise.getTime() + ms),
             prevSunset: new Date(times.prevSunset.getTime() + ms),
-            isValid: this.isValid
+            isValid: true
         } 
     }
     public getAdjustedTimes(hours = 0, min = 0): { sunrise?: Date, sunset?: Date, nextSunrise?: Date, nextSunset?: Date, prevSunrise?: Date, prevSunset: Date, isValid: boolean } {

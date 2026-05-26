@@ -18,9 +18,21 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 import { Inbound, Protocol } from "../Messages";
 import { state, BodyTempState, HeaterState } from "../../../State";
 import { sys, ControllerType, Heater } from "../../../Equipment";
+import { logger } from '../../../../logger/Logger';
 
 export class HeaterStateMessage {
     public static process(msg: Inbound) {
+        if (msg.protocol === Protocol.Jandy) {
+            switch (msg.action) {
+                case 0x0D:
+                    HeaterStateMessage.processJxiStatus(msg);
+                    break;
+                case 0x25:
+                    HeaterStateMessage.processJxiTempResponse(msg);
+                    break;
+            }
+            return;
+        }
         if (msg.protocol === Protocol.Heater) {
             switch (msg.action) {
                 case 112: // This is a message from a master controlling MasterTemp or UltraTemp ETi
@@ -85,33 +97,44 @@ export class HeaterStateMessage {
         msg.isProcessed = true;
     }
     public static processUltraTempStatus(msg: Inbound) {
-        // RKS: 07-03-21 - We only know byte 2 at this point for Ultratemp for the 115 message we are processing here.  The 
+        // RKS: 07-03-21 - UltraTemp RS-485 protocol reverse engineering notes.
+        // The heat pump communicates via Action 114 (command) / 115 (response) messages.
+        //
+        // Action 115 - inbound response (heat pump -> controller, heartbeat every ~1s)
+        // [165, 0, 16, 112, 115, 10][160, 1, 0, 3, 0, 0, 0, 0, 0, 0][2, 70]
         // byte  description
         // ------------------------------------------------
-        // 0    Unknown (always seems to be 160 for response)
-        // 1    Unknown (always 1)
-        // 2    Current heater status 0=off, 1=heat, 2=cool
-        // 3-9  Unknown
-        
-        // 114 message - outbound response
-        //[165, 0, 112, 16, 114, 10][144, 0, 0, 0, 0, 0, 0, 0, 0, 0][2, 49] // OCP to Heater
-        // byte  description
-        // ------------------------------------------------
-        // 0    Unknown (always seems to be 144 for request)
-        // 1    Current heater status 0=off, 1=heat, 2=cool
-        // 3    Believed to be ofset temp
+        // 0    Always 160 for response
+        // 1    Always 1
+        // 2    Current heater status: 0=off, 1=heat, 2=cool
+        // 3    Believed to be offset temp
         // 4-9  Unknown
-        
-        //   byto 0: always seems to be 144 for outbound
-        //   byte 1: Sets heater mode to 0 = Off 1 = Heat 2 = Cool
-        //[165, 0, 16, 112, 115, 10][160, 1, 0, 3, 0, 0, 0, 0, 0, 0][2, 70] // Heater Reply
+        //
+        // Action 114 - outbound command (controller -> heat pump)
+        // [165, 0, 112, 16, 114, 10][144, 0, 0, 0, 0, 0, 0, 0, 0, 0][2, 49]
+        // byte  description
+        // ------------------------------------------------
+        // 0    Always 144 for request
+        // 1    Sets heater mode: 0=off, 1=heat, 2=cool
+        // 3    Believed to be offset temp
+        // 4-9  Unknown
         let heater: Heater = sys.heaters.getItemByAddress(msg.source);
+        if (typeof heater === 'undefined' || !heater.isActive) {
+            // Heat pump not configured for this address
+            msg.isProcessed = true;
+            return;
+        }
         let sheater = state.heaters.getItemById(heater.id);
         let byte = msg.extractPayloadByte(2);
+        let prevOn = sheater.isOn;
+        let prevCooling = sheater.isCooling;
         sheater.isOn = byte >= 1;
         sheater.isCooling = byte === 2;
         sheater.commStatus = 0;
         state.equipment.messages.removeItemByCode(`heater:${heater.id}:comms`);
+        if (prevOn !== sheater.isOn || prevCooling !== sheater.isCooling) {
+            logger.info(`UltraTemp heartbeat: src=${msg.source} status=${byte} (${byte === 0 ? 'OFF' : byte === 1 ? 'HEAT' : 'COOL'}) heater=${heater.name}`);
+        }
         msg.isProcessed = true;
     }
     public static processMasterTempStatus(msg: Inbound) {
@@ -130,6 +153,47 @@ export class HeaterStateMessage {
         sheater.isCooling = false;
         sheater.commStatus = 0;
         state.equipment.messages.removeItemByCode(`heater:${heater.id}:comms`);
+        msg.isProcessed = true;
+    }
+    public static processJxiStatus(msg: Inbound) {
+        let jxiType = sys.board.valueMaps.heaterTypes.getValue('jxi');
+        let lxiType = sys.board.valueMaps.heaterTypes.getValue('lxi');
+        let heater = sys.heaters.find(h =>
+            (h.type === jxiType || h.type === lxiType) && h.isActive !== false
+        );
+        if (typeof heater === 'undefined') { msg.isProcessed = true; return; }
+        let sheater = state.heaters.getItemById(heater.id);
+        let heatByte = msg.extractPayloadByte(0);
+        let errByte = msg.extractPayloadByte(2);
+        sheater.isOn = (heatByte & 0x08) !== 0;
+        sheater.commStatus = 0;
+        state.equipment.messages.removeItemByCode(`heater:${heater.id}:comms`);
+        if (errByte & 0x10)
+            state.equipment.messages.setMessageByCode(`heater:${heater.id}:hilimit`, 'error', `${heater.name}: Hi-limit/flue temperature fault`);
+        else
+            state.equipment.messages.removeItemByCode(`heater:${heater.id}:hilimit`);
+        if (errByte & 0x02)
+            state.equipment.messages.setMessageByCode(`heater:${heater.id}:sensor`, 'error', `${heater.name}: Water sensor fault`);
+        else
+            state.equipment.messages.removeItemByCode(`heater:${heater.id}:sensor`);
+        if (errByte & 0x08)
+            state.equipment.messages.setMessageByCode(`heater:${heater.id}:pump`, 'warning', `${heater.name}: Pump/AUX monitor fault`);
+        else
+            state.equipment.messages.removeItemByCode(`heater:${heater.id}:pump`);
+        msg.isProcessed = true;
+    }
+    public static processJxiTempResponse(msg: Inbound) {
+        let jxiType = sys.board.valueMaps.heaterTypes.getValue('jxi');
+        let lxiType = sys.board.valueMaps.heaterTypes.getValue('lxi');
+        let heater = sys.heaters.find(h =>
+            (h.type === jxiType || h.type === lxiType) && h.isActive !== false
+        );
+        if (typeof heater === 'undefined') { msg.isProcessed = true; return; }
+        let tempByte = msg.extractPayloadByte(5);
+        if (typeof tempByte !== 'undefined' && tempByte > 20) {
+            let tempF = tempByte - 20;
+            logger.info(`JXi heater ${heater.name}: water temp ${tempF}°F`);
+        }
         msg.isProcessed = true;
     }
 

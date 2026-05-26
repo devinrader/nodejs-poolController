@@ -42,6 +42,8 @@ import { IntellichemMessage } from "./config/IntellichemMessage";
 import { TouchScheduleCommands } from "controller/boards/EasyTouchBoard";
 import { IntelliValveStateMessage } from "./status/IntelliValveStateMessage";
 import { IntelliChemStateMessage } from "./status/IntelliChemStateMessage";
+import { RegalModbusStateMessage } from "./status/RegalModbusStateMessage";
+import { NeptuneModbusStateMessage } from "./status/NeptuneModbusStateMessage";
 import { OutboundMessageError } from "../../Errors";
 import { conn } from "../Comms"
 import extend = require("extend");
@@ -61,7 +63,10 @@ export enum Protocol {
     Heater = 'heater',
     AquaLink = 'aqualink',
     Hayward = 'hayward',
-    Unidentified = 'unidentified'
+    Unidentified = 'unidentified',
+    RegalModbus = 'regalmodbus',
+    NeptuneModbus = 'neptunemodbus',
+    Jandy = 'jandy'
 }
 export class Message {
     constructor() { }
@@ -69,7 +74,8 @@ export class Message {
     // Internal Storage
     protected _complete: boolean = false;
     public static headerSubByte: number = 33;
-    public static pluginAddress: number = config.getSection('controller', { address: 33 }).address;
+    public static configuredPluginAddress: number = config.getSection('controller', { address: 33 }).address;
+    public static pluginAddress: number = Message.configuredPluginAddress;
     private _id: number = -1;
     // Fields
     private static _messageId: number = 0;
@@ -77,6 +83,33 @@ export class Message {
         let i = this._messageId < 80000 ? ++this._messageId : this._messageId = 0;
         //logger.debug(`Assigning message id ${i}`)
         return i; }
+    public static setPluginAddress(address: number, reason = 'runtime update'): void {
+        if (typeof address !== 'number' || !isFinite(address)) return;
+        const normalized = Math.max(0, Math.min(255, Math.trunc(address)));
+        if (Message.pluginAddress === normalized && Message.statePluginAddressInSync(normalized)) return;
+        if (Message.pluginAddress !== normalized) {
+            logger.info(`Updating plugin address from ${Message.pluginAddress} to ${normalized} (${reason})`);
+            Message.pluginAddress = normalized;
+        }
+        Message.syncPluginAddressToState(normalized);
+    }
+    // Publishes the current plugin address to state.equipment so dashPanel (and any
+    // socket listeners) can render the correct "njsPC" label for whichever RS-485
+    // slot we are currently occupying. Safe to call before state is constructed.
+    public static publishPluginAddress(): void {
+        Message.syncPluginAddressToState(Message.pluginAddress);
+    }
+    private static statePluginAddressInSync(val: number): boolean {
+        try { return !!(state && state.equipment && state.equipment.pluginAddress === val); }
+        catch (_err) { return false; }
+    }
+    private static syncPluginAddressToState(val: number): void {
+        try {
+            if (state && state.equipment && state.equipment.pluginAddress !== val) {
+                state.equipment.pluginAddress = val;
+            }
+        } catch (_err) { /* state not ready yet; will be synced on next call */ }
+    }
     public portId = 0; // This will be the target or source port for the message.  If this is from or to an Aux RS485 port the value will be > 0.
     public timestamp: Date = new Date();
     public direction: Direction = Direction.In;
@@ -97,13 +130,19 @@ export class Message {
     public get sub(): number { return this.header.length > 1 ? this.header[1] : -1; }
     public get dest(): number {
         if (this.header.length > 2) {
-            if (this.protocol === Protocol.Chlorinator || this.protocol === Protocol.AquaLink) {
+            if (this.protocol === Protocol.Chlorinator || this.protocol === Protocol.AquaLink || this.protocol === Protocol.Jandy) {
                 return this.header.length > 2 ? (this.header[2] >= 80 ? this.header[2] : 0) : -1;
             }
             else if (this.protocol === Protocol.Hayward) {
                 //            src   act   dest             
                 //0x10, 0x02, 0x00, 0x0C, 0x00, 0x00, 0x2D, 0x02, 0x36, 0x00, 0x83, 0x10, 0x03 -- Response from pump
                 return this.header.length > 4 ? this.header[2] : -1;
+            }
+            else if (this.protocol === Protocol.RegalModbus) {
+                return this.header.length > 0 ? this.header[0] : -1;
+            }
+            else if (this.protocol === Protocol.NeptuneModbus) {
+                return this.header.length > 0 ? this.header[0] : -1;
             }
             else return this.header.length > 2 ? this.header[2] : -1;
         }
@@ -118,7 +157,7 @@ export class Message {
             // have to assume it was sent from the 1st chlorinator (1)
             // until we learn otherwise.  
         }
-        else if (this.protocol === Protocol.AquaLink) {
+        else if (this.protocol === Protocol.AquaLink || this.protocol === Protocol.Jandy) {
             // Once we decode the devices we will be able to tell where it came from based upon the commands.
             return 0;
         }
@@ -128,28 +167,104 @@ export class Message {
             //0x10, 0x02, 0x0C, 0x01, 0x02, 0x2D, 0x00, 0x4E, 0x10, 0x03 -- Command to AUX2 Pump
             return this.header.length > 4 ? this.header[4] : -1;
         }
+        else if (this.protocol === Protocol.RegalModbus) {
+            // No source address in RegalModbus.
+            return -1;
+        }
+        else if (this.protocol === Protocol.NeptuneModbus) {
+            // No source address in Neptune Modbus RTU messages.
+            return -1;
+        }
         if (this.header.length > 3) return this.header[3];
         else return -1;
     }
     public get action(): number {
         // The action byte is actually the 4th byte in the header the destination address is the 5th byte.
         if (this.protocol === Protocol.Chlorinator ||
-            this.protocol === Protocol.AquaLink) return this.header.length > 3 ? this.header[3] : -1;
+            this.protocol === Protocol.AquaLink ||
+            this.protocol === Protocol.Jandy) return this.header.length > 3 ? this.header[3] : -1;
         else if (this.protocol === Protocol.Hayward) {
             //            src   act   dest             
             //0x10, 0x02, 0x00, 0x0C, 0x00, 0x00, 0x2D, 0x02, 0x36, 0x00, 0x83, 0x10, 0x03 -- Response from pump
             //0x10, 0x02, 0x0C, 0x01, 0x02, 0x2D, 0x00, 0x4E, 0x10, 0x03 -- Command to AUX2 Pump
             return this.header.length > 3 ? this.header[3] || this.header[2] : -1;
         }
+        else if (this.protocol === Protocol.RegalModbus) {
+            return this.header.length > 1 ? this.header[1]: -1;
+        }
+        else if (this.protocol === Protocol.NeptuneModbus) {
+            return this.header.length > 1 ? this.header[1] : -1;
+        }
+        else if (this.header.length > 4) return this.header[4];
+        else return -1;
         if (this.header.length > 4) return this.header[4];
         else return -1;
     }
-    public get datalen(): number { return this.protocol === Protocol.Chlorinator || this.protocol === Protocol.AquaLink || this.protocol === Protocol.Hayward ? this.payload.length : this.header.length > 5 ? this.header[5] : -1; }
-    public get chkHi(): number { return this.protocol === Protocol.Chlorinator || this.protocol === Protocol.AquaLink ? 0 : this.term.length > 0 ? this.term[0] : -1; }
-    public get chkLo(): number { return this.protocol === Protocol.Chlorinator || this.protocol === Protocol.AquaLink ? this.term[0] : this.term[1]; }
+    public get datalen(): number {
+        if (
+            this.protocol === Protocol.Chlorinator ||
+            this.protocol === Protocol.AquaLink ||
+            this.protocol === Protocol.Hayward ||
+            this.protocol === Protocol.Jandy
+        ) {
+            return this.payload.length;
+        }
+        else if (this.protocol === Protocol.RegalModbus) {
+            let action = this.action;
+            let ack = this.header[2];
+            switch (action) {
+                case 0x41: // Go
+                case 0x42: // Stop
+                    return 0;
+                case 0x43: // Status
+                    switch (ack) {
+                        case 0x10:
+                            return 1;
+                        case 0x20:
+                            return 0
+                    }
+                case 0x44:  // Set demand
+                    return 3;
+                case 0x45: // Read sensor
+                    switch (ack) {
+                        case 0x10:
+                            return 4;
+                        case 0x20:
+                            return 2;
+                    }
+                case 0x46:  // Read identification
+                    console.log("RegalModbus: Read identification not implemented yet.");
+                    break;
+                case 0x64:  // Configuration read/write
+                    console.log("RegalModbus: Configuration read/write not implemented yet.");
+                    break;
+                case 0x65:  // Store configuration
+                    return 0;
+            }
+        }
+        else if (this.protocol === Protocol.NeptuneModbus) {
+            let action = this.action;
+            if (action === 0x03 || action === 0x04) {
+                // Payload format: [byteCount, data...]
+                return this.payload.length > 0 ? this.payload[0] + 1 : -1;
+            }
+            if (action === 0x06 || action === 0x08 || action === 0x10) {
+                // Write single / diagnostics / write multiple response: addrHi, addrLo, val/qtyHi, val/qtyLo
+                return 4;
+            }
+            if ((action & 0x80) === 0x80) {
+                // Modbus exception response: one-byte exception code.
+                return 1;
+            }
+        }
+        return this.header.length > 5 ? this.header[5] : -1;
+    }
+    public get chkHi(): number { return this.protocol === Protocol.Chlorinator || this.protocol === Protocol.AquaLink || this.protocol === Protocol.Jandy ? 0 : this.term.length > 0 ? this.term[0] : -1; }
+    public get chkLo(): number { return this.protocol === Protocol.Chlorinator || this.protocol === Protocol.AquaLink || this.protocol === Protocol.Jandy ? this.term[0] : this.term[1]; }
     public get checksum(): number {
         var sum = 0;
-        for (let i = 0; i < this.header.length; i++) sum += this.header[i];
+        let start = this.protocol === Protocol.Jandy ? 2 : 0;
+        for (let i = start; i < this.header.length; i++) sum += this.header[i];
         for (let i = 0; i < this.payload.length; i++) sum += this.payload[i];
         return sum;
     }
@@ -249,8 +364,26 @@ export class Inbound extends Message {
     public rewinds: number = 0;
     // Private methods
     private isValidChecksum(): boolean {
-        if (this.protocol === Protocol.Chlorinator || this.protocol === Protocol.AquaLink) return this.checksum % 256 === this.chkLo;
-        return (this.chkHi * 256) + this.chkLo === this.checksum;
+        switch (this.protocol) {
+            case Protocol.Chlorinator:
+            case Protocol.AquaLink:
+            case Protocol.Jandy:
+                return this.checksum % 256 === this.chkLo;
+            case Protocol.RegalModbus: {
+                const data = this.header.concat(this.payload);
+                const crcComputed = computeCRC16(data);
+                const crcReceived = (this.chkLo << 8) | this.chkHi;
+                return crcComputed === crcReceived;
+            }
+            case Protocol.NeptuneModbus: {
+                const data = this.header.concat(this.payload);
+                const crcComputed = computeCRC16(data);
+                const crcReceived = (this.chkLo << 8) | this.chkHi;
+                return crcComputed === crcReceived;
+            }
+            default:
+                return (this.chkHi * 256) + this.chkLo === this.checksum;
+        }
     }
     public toLog() {
         if (this.responseFor.length > 0)
@@ -281,6 +414,60 @@ export class Inbound extends Message {
                 }
                 return true;
             }
+        }
+        return false;
+    }
+    private testRegalModbusHeader(bytes: number[], ndx: number): boolean {
+        // RegalModbus protocol: header, function, ack, payload, crcLo, crcHi
+        // Only accept messages from configured Regal Modbus pumps (by address) to avoid misidentifying noise/broadcast fragments
+        if (bytes.length > ndx + 3 && sys.controllerType === 'nixie') {
+            let addr = bytes[ndx];
+            const regalType = sys.board.valueMaps.pumpTypes.getValue('regalmodbus');
+            if (typeof sys.pumps.find(p => p.address === addr && p.type === regalType) === 'undefined') {
+                return false;
+            }
+            let func = bytes[ndx + 1];
+            let ack = bytes[ndx + 2];
+            let acceptableAcks = [0x10, 0x20, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x09, 0x0A];
+
+            if (addr >= 0x15 && addr <= 0xF7 && func >= 0x00 && func <= 0x7F && acceptableAcks.includes(ack) &&
+                this.isAddressForPumpType(addr, 'regalmodbus', ['neptunemodbus'])) {
+                return true;
+            }
+        }
+        return false;
+    }
+    private isAddressForPumpType(address: number, pumpTypeName: string, peerPumpTypes: string[] = []): boolean {
+        let hasTargetType = false;
+        let hasPeerType = false;
+        for (let i = 0; i < sys.pumps.length; i++) {
+            const pump = sys.pumps.getItemByIndex(i);
+            const typeName = sys.board.valueMaps.pumpTypes.getName(pump.type);
+            if (typeName === pumpTypeName) {
+                hasTargetType = true;
+                if (pump.address === address) return true;
+            }
+            else if (peerPumpTypes.includes(typeName)) {
+                hasPeerType = true;
+            }
+        }
+        if (hasTargetType) return false;
+        if (hasPeerType) return false;
+        // If neither protocol type is configured yet, allow detection.
+        return true;
+    }
+    private testNeptuneModbusHeader(bytes: number[], ndx: number): boolean {
+        // Neptune Modbus RTU: address, function, payload..., crcLo, crcHi
+        if (bytes.length > ndx + 4 && sys.controllerType === 'nixie') {
+            const addr = bytes[ndx];
+            const func = bytes[ndx + 1];
+            const supportedFuncs = [0x03, 0x04, 0x06, 0x08, 0x10, 0x83, 0x84, 0x86, 0x88, 0x90];
+            if (addr < 1 || addr > 247) return false;
+            if (!supportedFuncs.includes(func)) return false;
+            if (!this.isAddressForPumpType(addr, 'neptunemodbus', ['regalmodbus'])) return false;
+            // For read responses, byte count must be reasonable.
+            if ((func === 0x03 || func === 0x04) && bytes[ndx + 2] > 250) return false;
+            return true;
         }
         return false;
     }
@@ -332,6 +519,20 @@ export class Inbound extends Message {
     }
     private testChlorTerm(bytes: number[], ndx: number): boolean { return ndx + 2 < bytes.length && bytes[ndx + 1] === 16 && bytes[ndx + 2] === 3; }
     private testAquaLinkTerm(bytes: number[], ndx: number): boolean { return ndx + 2 < bytes.length && bytes[ndx + 1] === 16 && bytes[ndx + 2] === 3; }
+    private testJandyHeaterHeader(bytes: number[], ndx: number): boolean {
+        if (bytes.length <= ndx + 3) return false;
+        if (sys.controllerType === 'aqualink') return false;
+        if (bytes[ndx] !== 16 || bytes[ndx + 1] !== 2) return false;
+        const dest = bytes[ndx + 2];
+        const cmd = bytes[ndx + 3];
+        if ((dest >= 104 && dest <= 107) || (dest >= 56 && dest <= 59)) return true;
+        if (dest === 0 && (cmd === 0x0D || cmd === 0x25)) {
+            return typeof sys.heaters.find(h =>
+                (h.address >= 104 && h.address <= 107) || (h.address >= 56 && h.address <= 59)
+            ) !== 'undefined';
+        }
+        return false;
+    }
     private testHaywardTerm(bytes: number[], ndx: number): boolean { return ndx + 3 < bytes.length && bytes[ndx + 2] === 16 && bytes[ndx + 3] === 3; }
     private pushBytes(target: number[], bytes: number[], ndx: number, length: number): number {
         let end = ndx + length;
@@ -412,6 +613,20 @@ export class Inbound extends Message {
                     this.protocol = Protocol.Hayward;
                     break;
                 }
+                if (this.testJandyHeaterHeader(bytes, ndx)) {
+                    this.protocol = Protocol.Jandy;
+                    break;
+                }
+                if (this.testNeptuneModbusHeader(bytes, ndx)) {
+                    this.protocol = Protocol.NeptuneModbus;
+                    logger.debug(`NeptuneModbus header detected. ${JSON.stringify(bytes)}`);
+                    break;
+                }
+                if (this.testRegalModbusHeader(bytes, ndx)) {
+                    this.protocol = Protocol.RegalModbus;
+                    logger.debug(`RegalModbus header detected. ${JSON.stringify(bytes)}`);
+                    break;
+                }
                 this.padding.push(bytes[ndx++]);
             }
         }
@@ -446,7 +661,7 @@ export class Inbound extends Message {
                 else if (this.source == 12 || this.dest == 12) this.protocol = Protocol.IntelliValve;
                 if (this.datalen > 75) {
                     //this.isValid = false;
-                    logger.debug(`Broadcast length ${this.datalen} exceeded 75 bytes for ${this.protocol} message. Message rewound ${this.header}`);
+                    logger.silly(`Broadcast length ${this.datalen} exceeded 75 bytes for ${this.protocol} message. Message rewound ${this.header}`);
                     this.padding.push(...this.preamble);
                     this.padding.push(...this.header.slice(0, 1));
                     this.preamble = [];
@@ -468,7 +683,7 @@ export class Inbound extends Message {
                 if (this.header.length < 4) {
                     // We actually don't have a complete header yet so just return.
                     // we will pick it up next go around.
-                    logger.debug(`We have an incoming chlorinator message but the serial port hasn't given a complete header. [${this.padding}][${this.preamble}][${this.header}]`);
+                    logger.silly(`We have an incoming chlorinator message but the serial port hasn't given a complete header. [${this.padding}][${this.preamble}][${this.header}]`);
                     this.preamble = [];
                     this.header = [];
                     return ndxHeader;
@@ -479,7 +694,7 @@ export class Inbound extends Message {
                 if (this.header.length < 4) {
                     // We actually don't have a complete header yet so just return.
                     // we will pick it up next go around.
-                    logger.debug(`We have an incoming Hayward message but the serial port hasn't given a complete header. [${this.padding}][${this.preamble}][${this.header}]`);
+                    logger.silly(`We have an incoming Hayward message but the serial port hasn't given a complete header. [${this.padding}][${this.preamble}][${this.header}]`);
                     this.preamble = [];
                     this.header = [];
                     return ndxHeader;
@@ -490,7 +705,35 @@ export class Inbound extends Message {
                 if (this.header.length < 5) {
                     // We actually don't have a complete header yet so just return.
                     // we will pick it up next go around.
-                    logger.debug(`We have an incoming AquaLink message but the serial port hasn't given a complete header. [${this.padding}][${this.preamble}][${this.header}]`);
+                    logger.silly(`We have an incoming AquaLink message but the serial port hasn't given a complete header. [${this.padding}][${this.preamble}][${this.header}]`);
+                    this.preamble = [];
+                    this.header = [];
+                    return ndxHeader;
+                }
+                break;
+            case Protocol.Jandy:
+                ndx = this.pushBytes(this.header, bytes, ndx, 4);
+                if (this.header.length < 4) {
+                    this.preamble = [];
+                    this.header = [];
+                    return ndxHeader;
+                }
+                break;
+            case Protocol.RegalModbus:
+                ndx = this.pushBytes(this.header, bytes, ndx, 3);
+                if (this.header.length < 3) {
+                    // We actually don't have a complete header yet so just return.
+                    // we will pick it up next go around.
+                    logger.silly(`We have an incoming RegalModbus message but the serial port hasn't given a complete header. [${this.padding}][${this.preamble}][${this.header}]`);
+                    this.preamble = [];
+                    this.header = [];
+                    return ndxHeader;
+                }
+                break;
+            case Protocol.NeptuneModbus:
+                ndx = this.pushBytes(this.header, bytes, ndx, 2);
+                if (this.header.length < 2) {
+                    logger.silly(`We have an incoming NeptuneModbus message but the serial port hasn't given a complete header. [${this.padding}][${this.preamble}][${this.header}]`);
                     this.preamble = [];
                     this.header = [];
                     return ndxHeader;
@@ -507,7 +750,7 @@ export class Inbound extends Message {
                     ndx = bytes.length - 5;
                     let arr = bytes.slice(0, ndx);
                     // Remove all but the last 4 bytes.  This will result in nothing anyway.
-                    logger.verbose(`[Port ${this.portId}] Tossed Inbound Bytes ${arr} due to an unrecoverable collision.`);
+                    logger.silly(`[Port ${this.portId}] Tossed Inbound Bytes ${arr} due to an unrecoverable collision.`);
                 }
                 this.padding = [];
                 break;
@@ -544,13 +787,14 @@ export class Inbound extends Message {
                 }
                 break;
             case Protocol.AquaLink:
-                // We need to deal with AquaLink packets where the terminator is actually split meaning only the first byte or
+            case Protocol.Jandy:
+                // We need to deal with AquaLink/Jandy packets where the terminator is actually split meaning only the first byte or
                 // two of the total payload is provided for the term.  We need at least 3 bytes to make this determination.
                 while (ndx + 3 <= bytes.length && !this.testAquaLinkTerm(bytes, ndx)) {
                     this.payload.push(bytes[ndx++]);
                     if (this.payload.length > 25) {
                         this.isValid = false; // We have a runaway packet.  Some collision occurred so lets preserve future packets.
-                        logger.debug(`AquaLink message marked as invalid after not finding 16,3 in payload after ${this.payload.length} bytes`);
+                        logger.silly(`AquaLink/Jandy message marked as invalid after not finding 16,3 in payload after ${this.payload.length} bytes`);
                         break;
                     }
                 }
@@ -567,6 +811,55 @@ export class Inbound extends Message {
                     }
                 }
                 break;
+            case Protocol.RegalModbus:
+                // RegalModbus protocol: header, function, ack, payload, crcLo, crcHi
+                while (ndx + 3 <= bytes.length) {
+                    this.payload.push(bytes[ndx++]);
+                    if (this.payload.length > 11) {
+                        this.isValid = false; // We have a runaway packet.  Some collision occurred so lets preserve future packets.
+                        logger.debug(`RegalModbus message marked as invalid due to payload more than 11 bytes`);
+                        break;
+                    }
+                }
+                break;
+            case Protocol.NeptuneModbus: {
+                // Neptune Modbus RTU: [addr, fn][payload][crcLo, crcHi]
+                const functionCode = this.action;
+                if (functionCode === 0x03 || functionCode === 0x04) {
+                    // Read response payload: [byteCount, data...]
+                    if (this.payload.length === 0 && ndx < bytes.length - 2) {
+                        this.payload.push(bytes[ndx++]);
+                    }
+                    const byteCount = this.payload[0];
+                    if (typeof byteCount !== 'undefined') {
+                        if (byteCount > 250) {
+                            this.isValid = false;
+                            logger.debug(`NeptuneModbus message marked invalid due to unreasonable byteCount ${byteCount}`);
+                            break;
+                        }
+                        ndx = this.pushBytes(this.payload, bytes, ndx, (byteCount + 1) - this.payload.length);
+                    }
+                }
+                else if (functionCode === 0x06 || functionCode === 0x08 || functionCode === 0x10) {
+                    // Echo response payload: 4 bytes.
+                    ndx = this.pushBytes(this.payload, bytes, ndx, 4 - this.payload.length);
+                }
+                else if ((functionCode & 0x80) === 0x80) {
+                    // Exception response payload: one-byte code.
+                    ndx = this.pushBytes(this.payload, bytes, ndx, 1 - this.payload.length);
+                }
+                else {
+                    while (ndx + 3 <= bytes.length) {
+                        this.payload.push(bytes[ndx++]);
+                        if (this.payload.length > 253) {
+                            this.isValid = false;
+                            logger.debug(`NeptuneModbus message marked invalid due to payload more than 253 bytes`);
+                            break;
+                        }
+                    }
+                }
+                break;
+            }
 
         }
         return ndx;
@@ -580,10 +873,12 @@ export class Inbound extends Message {
             case Protocol.IntelliValve:
             case Protocol.IntelliChem:
             case Protocol.Heater:
+            case Protocol.RegalModbus:
+            case Protocol.NeptuneModbus:
             case Protocol.Unidentified:
                 // If we don't have enough bytes to make the terminator then continue on and
                 // hope we get them on the next go around.
-                if (this.payload.length >= this.datalen && ndx + 2 <= bytes.length) {
+                if (this.datalen >= 0 && this.payload.length >= this.datalen && ndx + 2 <= bytes.length) {
                     this._complete = true;
                     ndx = this.pushBytes(this.term, bytes, ndx, 2);
                     this.isValid = this.isValidChecksum();
@@ -597,6 +892,7 @@ export class Inbound extends Message {
                 }
                 break;
             case Protocol.AquaLink:
+            case Protocol.Jandy:
                 if (ndx + 3 <= bytes.length && this.testAquaLinkTerm(bytes, ndx)) {
                     this._complete = true;
                     ndx = this.pushBytes(this.term, bytes, ndx, 3);
@@ -647,7 +943,13 @@ export class Inbound extends Message {
             case ControllerType.IntelliCenter:
                 switch (this.action) {
                     case 1: // ACK
-                        this.isProcessed = true;
+                        // v3.004+ piggyback: only route ACKs we care about (168/184) into a single handler
+                        // to avoid doing extra work on every ACK frame.
+                        if (this.payload.length === 1 && (this.payload[0] === 168 || this.payload[0] === 184)) {
+                            VersionMessage.processActionAck(this);
+                        } else {
+                            this.isProcessed = true;
+                        }
                         break;
                     case 2:
                     case 204:
@@ -665,9 +967,35 @@ export class Inbound extends Message {
                     case 168:
                         ExternalMessage.processIntelliCenter(this);
                         break;
-                    case 222: // A panel is asking for action 30s
-                    case 228: // A panel is asking for the current version
+                    case 179: // v3.004+ Heartbeat request - handled by EquipmentStateMessage
+                        EquipmentStateMessage.process(this);
+                        break;
+                    case 180: // v3.004+ Heartbeat response/status (may be sent by other devices)
+                        // No processing required; mark as handled to avoid noisy "not processed" logs.
                         this.isProcessed = true;
+                        break;
+                    case 184: // v3.004+ Circuit control from wireless remote (replaces Action 134)
+                        // Wireless remote sends this to control circuits
+                        // Currently handled by EquipmentStateMessage for logging
+                        EquipmentStateMessage.process(this);
+                        break;
+                    case 217: // v3.004+ Device list broadcast 
+                        EquipmentStateMessage.process(this);
+                        break;
+                    case 222: // A panel is asking for action 30s
+                        this.isProcessed = true;
+                        break;
+                    case 228: // A panel is asking for the current version
+                        VersionMessage.processVersionRequest(this);
+                        break;
+                    case 251: // v3.004+ Device announcement/registration request
+                        // Devices send this to announce presence to OCP
+                        // Payload byte 0: device address
+                        // Response: Action 253
+                        this.isProcessed = true;
+                        break;
+                    case 253: // v3.004+ Device registration confirmation
+                        EquipmentStateMessage.process(this);
                         break;
                     default:
                         logger.info(`An unprocessed message was received ${this.toPacket()}`)
@@ -778,12 +1106,27 @@ export class Inbound extends Message {
         }
     }
     public process() {
-        let port = conn.findPortById(this.portId);
-        if (this.portId === sys.anslq25.portId) {
-            return MessagesMock.process(this);
-        }
-        if (port.mock && port.hasAssignedEquipment()){
-            return MessagesMock.process(this);
+        const isReplay = this.scope === 'replay';
+        if (!isReplay) {
+            let port = conn.findPortById(this.portId);
+            if (this.portId === sys.anslq25.portId) {
+                return MessagesMock.process(this);
+            }
+            if (port.mock && port.hasAssignedEquipment()){
+                return MessagesMock.process(this);
+            }
+            // VirtualEquipment: wire-level simulator for downstream devices
+            // (pumps, etc.) that impersonate real hardware toward whichever
+            // master is on the bus (real OCP or njsPC/Nixie).  Config lives
+            // in data/virtualEquipment.json (not poolConfig), so it will not
+            // appear in sys.pumps / state.pumps.
+            const vEquip = sys.virtualEquipment;
+            if (vEquip) {
+                vEquip.observe(this);
+                if (vEquip.shouldAnswer(this)) {
+                    return vEquip.process(this);
+                }
+            }
         }
         switch (this.protocol) {
             case Protocol.Broadcast:
@@ -802,6 +1145,7 @@ export class Inbound extends Message {
                     this.processBroadcast();
                 break;
             case Protocol.Heater:
+            case Protocol.Jandy:
                 HeaterStateMessage.process(this);
                 break;
             case Protocol.Chlorinator:
@@ -809,6 +1153,12 @@ export class Inbound extends Message {
                 break;
             case Protocol.Hayward:
                 PumpStateMessage.processHayward(this);
+                break;
+            case Protocol.RegalModbus:
+                RegalModbusStateMessage.process(this);
+                break;
+            case Protocol.NeptuneModbus:
+                NeptuneModbusStateMessage.process(this);
                 break;
             default:
                 logger.debug(`Unprocessed Message ${this.toPacket()}`)
@@ -822,15 +1172,22 @@ class OutboundCommon extends Message {
     public set dest(val: number) {
         if (this.protocol === Protocol.Chlorinator) this.header[2] = val;
         else if (this.protocol === Protocol.Hayward) this.header[4] = val;
+        else if (this.protocol === Protocol.RegalModbus) this.header[0] = val;
+        else if (this.protocol === Protocol.NeptuneModbus) this.header[0] = val;
         else this.header[2] = val;
     }
     public get dest() { return super.dest; }
     public set source(val: number) {
         switch (this.protocol) {
             case Protocol.Chlorinator:
+            case Protocol.Jandy:
                 break;
             case Protocol.Hayward:
                 this.header[3] = val;
+                break;
+            case Protocol.RegalModbus:
+                break;
+            case Protocol.NeptuneModbus:
                 break;
             default:
                 this.header[3] = val;
@@ -845,8 +1202,17 @@ class OutboundCommon extends Message {
             case Protocol.Chlorinator:
                 this.header[3] = val;
                 break;
+            case Protocol.Jandy:
+                this.header[3] = val;
+                break;
             case Protocol.Hayward:
                 this.header[2] = val;
+                break;
+            case Protocol.RegalModbus:
+                this.header[1] = val;
+                break;
+            case Protocol.NeptuneModbus:
+                this.header[1] = val;
                 break;
             default:
                 this.header[4] = val;
@@ -854,7 +1220,11 @@ class OutboundCommon extends Message {
         }
     }
     public get action() { return super.action; }
-    public set datalen(val: number) { if (this.protocol !== Protocol.Chlorinator && this.protocol !== Protocol.Hayward) this.header[5] = val; }
+    public set datalen(val: number) { 
+        if (this.protocol !== Protocol.Chlorinator && this.protocol !== Protocol.Hayward && this.protocol !== Protocol.RegalModbus && this.protocol !== Protocol.NeptuneModbus && this.protocol !== Protocol.Jandy) {
+            this.header[5] = val; 
+        }
+    }
     public get datalen() { return super.datalen; }
     public set chkHi(val: number) { if (this.protocol !== Protocol.Chlorinator) this.term[0] = val; }
     public get chkHi() { return super.chkHi; }
@@ -873,11 +1243,29 @@ class OutboundCommon extends Message {
             case Protocol.Heater:
             case Protocol.Hayward:
                 this.chkHi = Math.floor(sum / 256);
-                this.chkLo = (sum - (super.chkHi * 256));
+                this.chkLo = (sum - (this.chkHi * 256));
                 break;
             case Protocol.AquaLink:
             case Protocol.Chlorinator:
+            case Protocol.Jandy:
                 this.term[0] = sum % 256;
+                break;
+            case Protocol.RegalModbus:
+                // Calculate checksum using the CRC16 algorithm and set chkHi and chkLo.
+                // This.payload is expected to be an array of numbers (byte values 0–255)
+                // combine header and payload for CRC calculation
+                let data: number[] = this.header.concat(this.payload);
+                const crc: number = computeCRC16(data);
+                // Extract the high and low bytes from the 16-bit CRC:
+                this.chkLo = (crc >> 8) & 0xFF;
+                this.chkHi = crc & 0xFF;
+                break;
+            case Protocol.NeptuneModbus:
+                // Modbus RTU CRC16 (LSB-first on the wire).
+                let modbusData: number[] = this.header.concat(this.payload);
+                const modbusCrc: number = computeCRC16(modbusData);
+                this.chkLo = (modbusCrc >> 8) & 0xFF;
+                this.chkHi = modbusCrc & 0xFF;
                 break;
         }
     }
@@ -893,7 +1281,7 @@ export class Outbound extends OutboundCommon {
         this.header.length = 0;
         this.term.length = 0;
         this.payload.length = 0;
-        if (proto === Protocol.Chlorinator || proto === Protocol.AquaLink) {
+        if (proto === Protocol.Chlorinator || proto === Protocol.AquaLink || proto === Protocol.Jandy) {
             this.header.push.apply(this.header, [16, 2, 0, 0]);
             this.term.push.apply(this.term, [0, 16, 3]);
         }
@@ -910,6 +1298,13 @@ export class Outbound extends OutboundCommon {
         else if (proto === Protocol.Hayward) {
             this.header.push.apply(this.header, [16, 2, 0, 0, 0]);
             this.term.push.apply(this.term, [0, 0, 16, 3]);
+        }
+        else if (proto === Protocol.RegalModbus) {
+            this.header.push.apply(this.header, [this.dest, this.action, 0x20]);
+        }
+        else if (proto === Protocol.NeptuneModbus) {
+            this.header.push.apply(this.header, [this.dest, this.action]);
+            this.term.push.apply(this.term, [0, 0]);
         }
         this.scope = scope;
         this.source = source;
@@ -1007,12 +1402,28 @@ export class Outbound extends OutboundCommon {
         if (ndx + 1 < this.payload.length) this.payload[ndx + 1] = b1;
         return this;
     }
+    public setPayloadIntBE(ndx: number, value: number, def?: number) {
+        if (typeof value === 'undefined' || isNaN(value)) value = def;
+        let b1 = Math.floor(value / 256);
+        let b0 = value - (b1 * 256);
+        if (ndx < this.payload.length) this.payload[ndx] = b1;
+        if (ndx + 1 < this.payload.length) this.payload[ndx + 1] = b0;
+        return this;
+    }
     public appendPayloadInt(value: number, def?: number) {
         if (typeof value === 'undefined' || isNaN(value)) value = def;
         let b1 = Math.floor(value / 256);
         let b0 = value - (b1 * 256);
         this.payload.push(b0);
         this.payload.push(b1);
+        return this;
+    }
+    public appendPayloadIntBE(value: number, def?: number) {
+        if (typeof value === 'undefined' || isNaN(value)) value = def;
+        let b1 = Math.floor(value / 256);
+        let b0 = value - (b1 * 256);
+        this.payload.push(b1);
+        this.payload.push(b0);
         return this;
     }
     public insertPayloadInt(ndx: number, value: number, def?: number) {
@@ -1147,19 +1558,24 @@ export class Response extends OutboundCommon {
         if (msgIn.protocol !== msgOut.protocol) { return false; }
         if (typeof msgIn === 'undefined') { return false; } // getting here on msg send failure
 
-        // if these properties were set on the Response (this) object via creation,
-        // then use the passed in values.  Otherwise, use the msgIn/msgOut matching rules        
-        if (this.action > 0 && this.payload.length > 0) {
-            if (this.action === msgIn.action) {
-                for (let i = 0; i < msgIn.payload.length; i++) {
-                    if (i > this.payload.length - 1)
-                        return false;
-                    if (this.payload[i] !== msgIn.payload[i]) return false;
-                    return true;
-                }
-            }
+        // If these properties were set on the Response (this) object via creation,
+        // then use the passed in values. Otherwise, use the msgIn/msgOut matching rules.
+        //
+        // NOTE: IntelliCenter response matching is handled in the IntelliCenter-specific block below
+        // to keep the logic in one place.
+        if (msgOut.protocol === Protocol.Heater) {
+            // Heater protocol: request action 114 → response action 115, etc.
+            // Verify response comes from the heater we addressed.
+            if (msgIn.source !== msgOut.dest || (msgIn.dest !== msgOut.source && msgIn.dest !== 16)) { return false; }
+            if (this.action > 0 && this.action === msgIn.action) return true;
+            return false;
         }
-        else if (this.action > 0) {
+        //
+        // Restore Response-level action matching for non-IntelliCenter protocols (e.g., Hayward).
+        // The Hayward Outbound action getter has a known index mismatch (reads source instead of action),
+        // so we use the Response object's action which stores it correctly in header[4].
+        // See: https://github.com/tagyoureit/nodejs-poolController/issues/1098
+        if (sys.controllerType !== ControllerType.IntelliCenter && this.action > 0) {
             if (this.action === msgIn.action) return true;
             else return false;
         }
@@ -1183,6 +1599,19 @@ export class Response extends OutboundCommon {
                     if (JSON.stringify(msgIn.payload) === JSON.stringify(msgOut.payload)) { return true; }
                     return false;
             }
+        }
+        else if (msgIn.protocol === Protocol.RegalModbus) {
+            // RegalModbus is a little different.  The action is the function code and the payload is the data.
+            // We are looking for a match on the action an ack of 0x10.
+            if (msgIn.action === msgOut.action && msgIn.header[2] === 0x10) return true;
+            return false;
+        }
+        else if (msgIn.protocol === Protocol.NeptuneModbus) {
+            // Neptune Modbus: match by address and function code; allow exception responses (fn | 0x80).
+            if (msgIn.dest !== msgOut.dest) return false;
+            if (msgIn.action === msgOut.action) return true;
+            if (msgIn.action === (msgOut.action | 0x80)) return true;
+            return false;
         }
         else if (msgIn.protocol === Protocol.Chlorinator) {
             switch (msgIn.action) {
@@ -1230,6 +1659,23 @@ export class Response extends OutboundCommon {
         }
         else if (sys.controllerType === ControllerType.IntelliCenter) {
             // intellicenter packets
+            // IntelliCenter config queue uses (action,payload-prefix) matching for Action 30 responses.
+            // Keep this scoped to IntelliCenter to avoid unintended effects on other controllers.
+            if (sys.equipment.isIntellicenterV3 && this.action > 0) {
+                if (this.action !== msgIn.action) return false;
+                // ISSUE-121: Do NOT enforce strict dest match on v3 Action 30 config responses.
+                // After address convergence (e.g. 33→32), msgIn.dest may differ from the
+                // request-time pluginAddress. Payload prefix [category, item] is unique enough
+                // (only OCP sends Action 30 to njsPC). v1.x relied on broadcast (dest=15) and
+                // matched by (action, payload-prefix) without dest enforcement — restoring that.
+                // If no payload prefix is provided, action match is sufficient (e.g. v3 Action 30 with empty payload).
+                if (this.payload.length === 0) return true;
+                if (msgIn.payload.length < this.payload.length) return false;
+                for (let i = 0; i < this.payload.length; i++) {
+                    if (msgIn.payload[i] !== this.payload[i]) return false;
+                }
+                return true;
+            }
             if (this.dest >= 0 && msgIn.dest !== this.dest) return false;
             for (let i = 0; i < this.payload.length; i++) {
                 if (i > msgIn.payload.length - 1)
@@ -1240,4 +1686,20 @@ export class Response extends OutboundCommon {
             return true;
         }
     }
+}
+
+/**
+ * Computes the CRC16 checksum over an array of bytes using the RegalModbus algorithm.
+ * @param data - The array of byte values (numbers between 0 and 255).
+ * @returns The computed 16-bit checksum.
+ */
+export function computeCRC16(data: number[]): number {
+    let crc = 0xFFFF;
+    for (const byte of data) {
+        crc ^= byte;
+        for (let j = 0; j < 8; j++) {
+            crc = (crc & 0x0001) ? (crc >> 1) ^ 0xA001 : crc >> 1;
+        }
+    }
+    return crc;
 }
